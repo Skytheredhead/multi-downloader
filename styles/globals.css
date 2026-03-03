@@ -1,0 +1,56 @@
+@import url("https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&display=swap");
+
+:root {
+  --font-ui: "Barlow", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-display: "Barlow Condensed", "Barlow", "Segoe UI", sans-serif;
+}
+
+html,
+body,
+#__next {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: #000;
+  font-family: var(--font-ui);
+}
+
+body {
+  position: relative;
+}
+
+#__next {
+  position: relative;
+  z-index: 1;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.03;
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.55) 1px, transparent 0),
+    radial-gradient(circle at 2px 3px, rgba(255, 255, 255, 0.3) 1px, transparent 0);
+  background-size: 3px 3px, 5px 5px;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background: radial-gradient(circle at 50% 45%, rgba(0, 0, 0, 0) 48%, rgba(0, 0, 0, 0.2) 100%);
+}
+
+:focus-visible {
+  outline: 2px solid rgba(225, 206, 255, 0.78);
+  outline-offset: 2px;
+}
+
+* {
+  box-sizing: border-box;
+}

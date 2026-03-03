@@ -2,14 +2,16 @@
   "name": "multi-downloader",
   "version": "0.1.0",
   "private": true,
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "NODE_ENV=development node server.cjs",
+    "build": "next build --webpack",
+    "start": "NODE_ENV=production node server.cjs"
   },
   "dependencies": {
-    "esbuild": "^0.25.2",
+    "@vercel/analytics": "^1.6.1",
     "express": "^5.1.0",
+    "next": "^16.1.6",
     "nodemailer": "^7.0.7",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"

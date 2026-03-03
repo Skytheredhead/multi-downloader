@@ -2,25 +2,16 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const readline = require("readline");
 const nodemailer = require("nodemailer");
-const esbuild = require("esbuild");
 const net = require("net");
+const next = require("next");
 
 const PORT = 4928;
 const ROOT = __dirname;
-const PUBLIC_DIR = path.join(ROOT, "public");
 const DOWNLOADS_DIR = path.join(ROOT, "downloads");
 const USERS_DOWNLOADS_DIR = path.join(DOWNLOADS_DIR, "users");
-
-const FRONTEND_ENTRY = path.join(ROOT, "frontend-entry.jsx");
-const LOGIN_ENTRY = path.join(ROOT, "login-entry.jsx");
-const HISTORY_ENTRY = path.join(ROOT, "history-entry.jsx");
-
-const APP_HTML = path.join(PUBLIC_DIR, "app.html");
-const LOGIN_HTML = path.join(PUBLIC_DIR, "login.html");
-const HISTORY_HTML = path.join(PUBLIC_DIR, "history.html");
 
 const SESSION_COOKIE = "md_session";
 const SESSION_TTL_HOURS = Math.max(1, Number(process.env.SESSION_TTL_HOURS || 24 * 30));
@@ -47,11 +38,23 @@ const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 const ACCESS_REQUESTS_FILE = path.join(ROOT, "access-requests.json");
 const USER_ACCOUNTS_FILE = path.join(ROOT, "user-accounts.json");
+const VIDEO_ACCEL_MODE = String(process.env.VIDEO_ACCEL_MODE || "auto").toLowerCase();
 
 const VALID_TYPES = new Set(["a+v", "a", "v"]);
 const VALID_QUALITIES = new Set(["hq", "mq", "lq"]);
 const VIDEO_CODECS = new Set(["h264", "h265", "mov", "webm"]);
 const AUDIO_CODECS = new Set(["wav", "mp3 (320)", "mp3 (128)"]);
+const VIDEO_THUMBNAIL_EXTS = new Set([
+  ".mp4",
+  ".mkv",
+  ".webm",
+  ".mov",
+  ".avi",
+  ".m4v",
+  ".mpg",
+  ".mpeg"
+]);
+const IMAGE_THUMBNAIL_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
 
 const jobs = new Map();
 const sessions = new Map();
@@ -64,23 +67,25 @@ const activeAccountsByUsername = new Map();
 const pendingAccountsById = new Map();
 
 let mailTransport = null;
+const NVIDIA_TRANSCODE_AVAILABLE = detectNvidiaTranscodeSupport();
 
-function ensureBundle() {
-  fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+function detectNvidiaTranscodeSupport() {
+  if (VIDEO_ACCEL_MODE === "off" || VIDEO_ACCEL_MODE === "none") return false;
+  if (VIDEO_ACCEL_MODE !== "auto" && VIDEO_ACCEL_MODE !== "on" && VIDEO_ACCEL_MODE !== "true") {
+    return false;
+  }
 
-  esbuild.buildSync({
-    entryPoints: {
-      app: FRONTEND_ENTRY,
-      login: LOGIN_ENTRY,
-      history: HISTORY_ENTRY
-    },
-    outdir: PUBLIC_DIR,
-    bundle: true,
-    minify: false,
-    sourcemap: true,
-    jsx: "automatic",
-    loader: { ".js": "jsx", ".jsx": "jsx" }
-  });
+  try {
+    const check = spawnSync("ffmpeg", ["-hide_banner", "-encoders"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      timeout: 4000
+    });
+    const output = `${check.stdout || ""}\n${check.stderr || ""}`;
+    return /h264_nvenc/i.test(output) && /hevc_nvenc/i.test(output);
+  } catch {
+    return false;
+  }
 }
 
 function normalizeIp(raw) {
@@ -692,12 +697,16 @@ function findActiveAccountByUsername(username) {
   return activeAccountsByUsername.get(normalizeUsername(username)) || null;
 }
 
-function hasActiveAccountByEmail(email) {
+function findActiveAccountByEmail(email) {
   const normalized = normalizeEmail(email);
   for (const account of activeAccountsByUsername.values()) {
-    if (account.email === normalized) return true;
+    if (account.email === normalized) return account;
   }
-  return false;
+  return null;
+}
+
+function hasActiveAccountByEmail(email) {
+  return Boolean(findActiveAccountByEmail(email));
 }
 
 function findPendingAccountByUsername(username) {
@@ -833,8 +842,106 @@ function finalizeAccessReview(record, action, reason = "") {
   saveAccessRequestsToDisk();
 }
 
+function renderThemedPage({ title = "dl.67mc.org", body = "", footer = "" }) {
+  const safeTitle = escapeHtml(title);
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${safeTitle}</title>
+    <style>
+      html, body {
+        margin: 0;
+        min-height: 100%;
+        background: linear-gradient(145deg, #06040b 0%, #120a1e 52%, #0a0711 100%);
+        color: #e7ecef;
+        font-family: "Nunito Sans", "Segoe UI", Tahoma, sans-serif;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        box-sizing: border-box;
+      }
+      .wrap {
+        width: min(640px, 100%);
+        border-radius: 14px;
+        background: rgba(25, 15, 41, 0.62);
+        backdrop-filter: blur(12px) saturate(110%);
+        -webkit-backdrop-filter: blur(12px) saturate(110%);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 8px 26px rgba(0, 0, 0, 0.28);
+        padding: 18px;
+      }
+      .title {
+        font-size: 28px;
+        letter-spacing: 0.5px;
+        margin: 0 0 8px 0;
+        color: #f2edff;
+        text-shadow: 0 8px 40px rgba(0, 0, 0, 0.45);
+      }
+      .body {
+        font-size: 14px;
+        line-height: 1.45;
+        color: #efe7ff;
+      }
+      .footer {
+        margin-top: 12px;
+        font-size: 12px;
+        color: #d6c9eb;
+        opacity: 0.85;
+      }
+      textarea {
+        width: 100%;
+        min-height: 170px;
+        resize: vertical;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(31, 17, 50, 0.62);
+        color: #efe7ff;
+        padding: 10px 12px;
+        box-sizing: border-box;
+        margin-top: 10px;
+        margin-bottom: 10px;
+        outline: none;
+      }
+      button {
+        height: 42px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        background: rgba(255, 255, 255, 0.17);
+        color: #fff;
+        font-size: 14px;
+        cursor: pointer;
+        min-width: 110px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="title">${safeTitle}</div>
+      <div class="body">${body}</div>
+      ${footer ? `<div class="footer">${footer}</div>` : ""}
+    </div>
+  </body>
+</html>`;
+}
+
 function renderSimpleHtmlPage(bodyHtml) {
-  return `<!doctype html><html><body>${bodyHtml}</body></html>`;
+  const safe = String(bodyHtml || "");
+  return renderThemedPage({
+    title: "dl.67mc.org",
+    body: safe
+  });
+}
+
+function renderDenyFormPage(token) {
+  return renderThemedPage({
+    title: "Deny Request",
+    body: `<form method="POST"><textarea name="reason" placeholder="Reason..."></textarea><input type="hidden" name="token" value="${escapeHtml(token)}" /><button type="submit">Send</button></form>`
+  });
 }
 
 function renderCenteredResultPage(title, subtitle = "") {
@@ -850,9 +957,9 @@ function renderCenteredResultPage(title, subtitle = "") {
       html, body {
         margin: 0;
         min-height: 100%;
-        background: #000;
-        color: #fff;
-        font-family: sans-serif;
+        background: linear-gradient(145deg, #06040b 0%, #120a1e 52%, #0a0711 100%);
+        color: #e7ecef;
+        font-family: "Nunito Sans", "Segoe UI", Tahoma, sans-serif;
       }
       body {
         display: flex;
@@ -860,9 +967,24 @@ function renderCenteredResultPage(title, subtitle = "") {
         justify-content: center;
         text-align: center;
       }
-      .wrap { padding: 24px; }
-      .title { font-size: 28px; letter-spacing: 0.5px; margin-bottom: 10px; }
-      .sub { font-size: 14px; opacity: 0.7; }
+      .wrap {
+        width: min(620px, calc(100% - 40px));
+        border-radius: 14px;
+        background: rgba(25, 15, 41, 0.62);
+        backdrop-filter: blur(12px) saturate(110%);
+        -webkit-backdrop-filter: blur(12px) saturate(110%);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 8px 26px rgba(0, 0, 0, 0.28);
+        padding: 24px;
+      }
+      .title {
+        font-size: 28px;
+        letter-spacing: 0.5px;
+        margin-bottom: 10px;
+        color: #f2edff;
+        text-shadow: 0 8px 40px rgba(0, 0, 0, 0.45);
+      }
+      .sub { font-size: 14px; color: #efe7ff; opacity: 0.85; }
     </style>
   </head>
   <body>
@@ -902,6 +1024,64 @@ function resolveSafePath(baseDir, relativePath) {
   if (target === base) return null;
   if (!target.startsWith(`${base}${path.sep}`)) return null;
   return target;
+}
+
+function toUserRelativePath(userRoot, absPath) {
+  const rel = path.relative(userRoot, absPath).split(path.sep).join("/");
+  if (!rel || rel.startsWith("..")) return "";
+  return rel;
+}
+
+function ensureThumbnailForFile(userRoot, absPath, preferredRelativePath = "") {
+  const ext = path.extname(absPath).toLowerCase();
+
+  if (IMAGE_THUMBNAIL_EXTS.has(ext)) {
+    return toUserRelativePath(userRoot, absPath);
+  }
+
+  if (!VIDEO_THUMBNAIL_EXTS.has(ext)) {
+    return "";
+  }
+
+  const existing = preferredRelativePath
+    ? resolveSafePath(userRoot, preferredRelativePath)
+    : null;
+  if (existing && fs.existsSync(existing)) {
+    return preferredRelativePath;
+  }
+
+  const parsed = path.parse(absPath);
+  const thumbPath = path.join(parsed.dir, `${parsed.name}.thumb.jpg`);
+
+  try {
+    const run = spawnSync(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        "00:00:00.500",
+        "-i",
+        absPath,
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=360:-1",
+        thumbPath
+      ],
+      { cwd: ROOT, timeout: 20000 }
+    );
+
+    if (run.status === 0 && fs.existsSync(thumbPath)) {
+      return toUserRelativePath(userRoot, thumbPath);
+    }
+  } catch {
+    // ignore thumbnail generation failures
+  }
+
+  return "";
 }
 
 function cleanupEmptyParents(startDir, stopDir) {
@@ -951,6 +1131,7 @@ function pruneUserDownloads(username) {
     const id = String(entry.id || "").trim();
     const fileName = String(entry.fileName || "").trim();
     const relativePath = String(entry.relativePath || "").trim();
+    const thumbnailRelativePath = String(entry.thumbnailRelativePath || "").trim();
     const createdAt = Number(entry.createdAt || 0);
 
     if (!id || !relativePath || !createdAt) {
@@ -990,12 +1171,22 @@ function pruneUserDownloads(username) {
       changed = true;
     }
 
+    const finalThumbnailRelativePath = ensureThumbnailForFile(
+      userRoot,
+      absPath,
+      thumbnailRelativePath
+    );
+    if (finalThumbnailRelativePath !== thumbnailRelativePath) {
+      changed = true;
+    }
+
     kept.push({
       id,
       fileName: fileName || path.basename(absPath),
       relativePath,
       sizeBytes,
-      createdAt
+      createdAt,
+      thumbnailRelativePath: finalThumbnailRelativePath
     });
   }
 
@@ -1020,7 +1211,7 @@ function getUserStorageStatus(username) {
   };
 }
 
-function appendUserDownloadRecord(username, { id, filePath, createdAt }) {
+function appendUserDownloadRecord(username, { id, filePath, createdAt, thumbnailPath = "" }) {
   const userRoot = getUserRoot(username);
   const relativePath = path.relative(userRoot, filePath).split(path.sep).join("/");
   if (!relativePath || relativePath.startsWith("..")) return false;
@@ -1033,12 +1224,23 @@ function appendUserDownloadRecord(username, { id, filePath, createdAt }) {
   }
 
   const entries = pruneUserDownloads(username).filter(entry => entry.id !== id);
+  let thumbnailRelativePath = "";
+  if (thumbnailPath) {
+    const safeThumb = resolveSafePath(userRoot, thumbnailPath);
+    if (safeThumb && fs.existsSync(safeThumb)) {
+      thumbnailRelativePath = toUserRelativePath(userRoot, safeThumb);
+    }
+  }
+  if (!thumbnailRelativePath) {
+    thumbnailRelativePath = ensureThumbnailForFile(userRoot, filePath);
+  }
   entries.unshift({
     id,
     fileName: path.basename(filePath),
     relativePath,
     sizeBytes,
-    createdAt
+    createdAt,
+    thumbnailRelativePath
   });
   saveUserManifest(username, entries);
   return true;
@@ -1065,6 +1267,33 @@ function clearUserDownloads(username) {
       }
     }
   }
+}
+
+function deleteUserDownloadById(username, id) {
+  const targetId = String(id || "").trim();
+  if (!targetId) return false;
+
+  const userRoot = getUserRoot(username);
+  const entries = pruneUserDownloads(username);
+  const index = entries.findIndex(item => item.id === targetId);
+  if (index < 0) return false;
+
+  const [entry] = entries.splice(index, 1);
+  const candidatePaths = new Set([entry.relativePath, entry.thumbnailRelativePath].filter(Boolean));
+
+  for (const relPath of candidatePaths) {
+    const absPath = resolveSafePath(userRoot, relPath);
+    if (!absPath || !fs.existsSync(absPath)) continue;
+    try {
+      fs.rmSync(absPath, { force: true });
+      cleanupEmptyParents(path.dirname(absPath), userRoot);
+    } catch {
+      // ignore per-item cleanup failures
+    }
+  }
+
+  saveUserManifest(username, entries);
+  return true;
 }
 
 function withFilter(selector, filter) {
@@ -1135,8 +1364,34 @@ function formatSelector(type, quality, codec) {
   return combined.join("/");
 }
 
-function postProcessArgs(type, codec) {
+function buildVideoTranscodePostprocessorArgs(type, codec, useNvidia) {
+  const parts = [];
+
+  if (codec === "h265") {
+    if (useNvidia) {
+      parts.push("-c:v", "hevc_nvenc", "-preset", "p4", "-cq", "28");
+    } else {
+      parts.push("-c:v", "libx265", "-preset", "medium", "-crf", "28");
+    }
+  } else {
+    if (useNvidia) {
+      parts.push("-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23");
+    } else {
+      parts.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "23");
+    }
+  }
+
+  if (type === "a+v") {
+    parts.push("-c:a", "aac", "-b:a", "192k");
+  }
+
+  return `ffmpeg:${parts.join(" ")}`;
+}
+
+function postProcessArgs(type, codec, options = {}) {
   const args = [];
+  const transcode = Boolean(options.transcode);
+  const useNvidia = Boolean(options.useNvidia);
 
   if (type === "a") {
     if (codec === "wav") {
@@ -1165,8 +1420,28 @@ function postProcessArgs(type, codec) {
     return args;
   }
 
+  if (!transcode) {
+    if (codec === "mov") {
+      args.push("--remux-video", "mov");
+      return args;
+    }
+
+    if (codec === "webm") {
+      args.push("--remux-video", "webm");
+      return args;
+    }
+
+    if (codec === "h264" || codec === "h265") {
+      args.push("--remux-video", "mp4", "--merge-output-format", "mp4");
+      return args;
+    }
+
+    return args;
+  }
+
   if (codec === "mov") {
     args.push("--recode-video", "mov");
+    args.push("--postprocessor-args", buildVideoTranscodePostprocessorArgs(type, "h264", useNvidia));
     return args;
   }
 
@@ -1177,19 +1452,13 @@ function postProcessArgs(type, codec) {
 
   if (codec === "h264") {
     args.push("--recode-video", "mp4");
-    args.push(
-      "--postprocessor-args",
-      type === "a+v" ? "ffmpeg:-c:v libx264 -c:a aac" : "ffmpeg:-c:v libx264"
-    );
+    args.push("--postprocessor-args", buildVideoTranscodePostprocessorArgs(type, "h264", useNvidia));
     return args;
   }
 
   if (codec === "h265") {
     args.push("--recode-video", "mp4");
-    args.push(
-      "--postprocessor-args",
-      type === "a+v" ? "ffmpeg:-c:v libx265 -c:a aac" : "ffmpeg:-c:v libx265"
-    );
+    args.push("--postprocessor-args", buildVideoTranscodePostprocessorArgs(type, "h265", useNvidia));
   }
 
   return args;
@@ -1232,11 +1501,15 @@ function emitJobUpdate(job, payload) {
 function setJobState(job, patch) {
   const next = {
     id: job.id,
-    status: patch.status ?? job.status,
-    message: patch.message ?? job.message,
-    progress: patch.progress ?? job.progress,
-    downloadUrl: patch.downloadUrl ?? job.downloadUrl,
-    error: patch.error ?? job.error
+    status: "status" in patch ? patch.status : job.status,
+    message: "message" in patch ? patch.message : job.message,
+    progress: "progress" in patch ? patch.progress : job.progress,
+    downloadUrl: "downloadUrl" in patch ? patch.downloadUrl : job.downloadUrl,
+    error: "error" in patch ? patch.error : job.error,
+    speed: "speed" in patch ? patch.speed : job.speed,
+    eta: "eta" in patch ? patch.eta : job.eta,
+    totalSize: "totalSize" in patch ? patch.totalSize : job.totalSize,
+    thumbnailUrl: "thumbnailUrl" in patch ? patch.thumbnailUrl : job.thumbnailUrl
   };
 
   job.status = next.status;
@@ -1244,6 +1517,10 @@ function setJobState(job, patch) {
   job.progress = next.progress;
   job.downloadUrl = next.downloadUrl;
   job.error = next.error;
+  job.speed = next.speed;
+  job.eta = next.eta;
+  job.totalSize = next.totalSize;
+  job.thumbnailUrl = next.thumbnailUrl;
 
   emitJobUpdate(job, next);
 }
@@ -1284,6 +1561,38 @@ function findNewestFile(dir) {
   return newest;
 }
 
+function findProviderThumbnail(jobDir, mediaPath) {
+  if (!fs.existsSync(jobDir)) return "";
+
+  const mediaResolved = path.resolve(mediaPath);
+  const mediaBaseName = path.parse(mediaPath).name;
+  const images = listFilesRecursive(jobDir).filter(candidate => {
+    const ext = path.extname(candidate).toLowerCase();
+    if (!IMAGE_THUMBNAIL_EXTS.has(ext)) return false;
+    if (path.resolve(candidate) === mediaResolved) return false;
+    return true;
+  });
+
+  if (images.length === 0) return "";
+
+  const ranked = images
+    .map(candidate => {
+      const parsed = path.parse(candidate);
+      const lowerName = parsed.name.toLowerCase();
+      let score = 0;
+      if (parsed.name === mediaBaseName || parsed.name.startsWith(mediaBaseName)) score += 4;
+      if (!lowerName.endsWith(".thumb")) score += 2;
+      if (lowerName.includes("maxres") || lowerName.includes("hqdefault") || lowerName.includes("thumbnail")) {
+        score += 1;
+      }
+      const mtime = fs.statSync(candidate).mtimeMs;
+      return { candidate, score, mtime };
+    })
+    .sort((a, b) => b.score - a.score || b.mtime - a.mtime);
+
+  return ranked[0]?.candidate || "";
+}
+
 function parseProgress(line) {
   const match = line.match(/\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/i);
   if (!match) return null;
@@ -1292,16 +1601,49 @@ function parseProgress(line) {
   return Math.max(0, Math.min(100, raw));
 }
 
+function parseDownloadStats(line) {
+  const speedMatch = line.match(/\sat\s+([0-9.]+\s*[KMGTP]?i?B\/s)/i);
+  const etaMatch = line.match(/\sETA\s+([0-9:]+)/i);
+  const totalMatch = line.match(/\sof\s+~?\s*([0-9.]+\s*[KMGTP]?i?B)/i);
+
+  return {
+    speed: speedMatch ? speedMatch[1].replace(/\s+/g, "") : null,
+    eta: etaMatch ? etaMatch[1] : null,
+    totalSize: totalMatch ? totalMatch[1].replace(/\s+/g, "") : null
+  };
+}
+
+function formatBinaryBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return null;
+  if (value < 1024) return `${Math.round(value)}B`;
+
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let amount = value / 1024;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+
+  const precision = amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+  return `${amount.toFixed(precision)}${units[unitIndex]}`;
+}
+
 function handleYtDlpLine(job, line) {
   const text = line.trim();
   if (!text) return;
 
   const progress = parseProgress(text);
   if (progress !== null) {
+    const stats = parseDownloadStats(text);
     setJobState(job, {
       status: "running",
       message: `Downloading... ${progress.toFixed(1)}%`,
-      progress
+      progress,
+      speed: stats.speed,
+      eta: stats.eta,
+      totalSize: stats.totalSize
     });
     return;
   }
@@ -1309,7 +1651,9 @@ function handleYtDlpLine(job, line) {
   if (text.includes("Destination:")) {
     setJobState(job, {
       status: "running",
-      message: "Preparing output file..."
+      message: "Preparing output file...",
+      speed: null,
+      eta: null
     });
     return;
   }
@@ -1318,11 +1662,20 @@ function handleYtDlpLine(job, line) {
     text.includes("[Merger]") ||
     text.includes("[ExtractAudio]") ||
     text.includes("[VideoConvertor]") ||
+    text.includes("[VideoRemuxer]") ||
     text.includes("[Fixup")
   ) {
+    const message =
+      text.includes("[Merger]") || text.includes("[VideoRemuxer]") || text.includes("[Fixup")
+        ? "Remuxing media..."
+        : text.includes("[VideoConvertor]")
+          ? "Transcoding for compatibility..."
+          : "Processing media...";
     setJobState(job, {
       status: "processing",
-      message: "Processing media..."
+      message,
+      speed: null,
+      eta: null
     });
     return;
   }
@@ -1330,7 +1683,9 @@ function handleYtDlpLine(job, line) {
   if (text.includes("has already been downloaded")) {
     setJobState(job, {
       status: "processing",
-      message: "Using existing downloaded media..."
+      message: "Reusing previously downloaded media...",
+      speed: null,
+      eta: null
     });
     return;
   }
@@ -1339,9 +1694,56 @@ function handleYtDlpLine(job, line) {
     setJobState(job, {
       status: "failed",
       message: "Download failed.",
-      error: text.replace(/^ERROR:\s*/, "")
+      error: text.replace(/^ERROR:\s*/, ""),
+      speed: null,
+      eta: null
     });
   }
+}
+
+function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidia }) {
+  const format = formatSelector(type, quality, codec);
+  return [
+    "--no-playlist",
+    "--no-overwrites",
+    "--newline",
+    "--write-thumbnail",
+    "--convert-thumbnails",
+    "jpg",
+    "-P",
+    jobDir,
+    "-o",
+    "%(title).180B [%(id)s].%(ext)s",
+    "-f",
+    format,
+    ...postProcessArgs(type, codec, { transcode, useNvidia }),
+    url
+  ];
+}
+
+function shouldRetryWithTranscode(type, lines) {
+  if (type === "a") return false;
+  const text = lines.join("\n").toLowerCase();
+  return (
+    text.includes("ffmpeg") ||
+    text.includes("videoremuxer") ||
+    text.includes("videoconvertor") ||
+    text.includes("postprocessing") ||
+    text.includes("conversion failed") ||
+    text.includes("could not write header") ||
+    text.includes("invalid argument")
+  );
+}
+
+function buildAttemptPlan(type) {
+  const plan = [{ transcode: false, useNvidia: false, label: "fast-remux" }];
+  if (type === "a") return plan;
+
+  if (NVIDIA_TRANSCODE_AVAILABLE) {
+    plan.push({ transcode: true, useNvidia: true, label: "gpu-transcode" });
+  }
+  plan.push({ transcode: true, useNvidia: false, label: "cpu-transcode" });
+  return plan;
 }
 
 function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
@@ -1360,6 +1762,10 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
     message: "Queued...",
     progress: 0,
     error: null,
+    speed: null,
+    eta: null,
+    totalSize: null,
+    thumbnailUrl: null,
     downloadUrl: null,
     filePath: null,
     createdAt: Date.now(),
@@ -1370,98 +1776,152 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
       message: "Queued...",
       progress: 0,
       downloadUrl: null,
-      error: null
+      error: null,
+      speed: null,
+      eta: null,
+      totalSize: null,
+      thumbnailUrl: null
     }
   };
 
   jobs.set(id, job);
 
-  const format = formatSelector(type, quality, codec);
-  const args = [
-    "--no-playlist",
-    "--newline",
-    "-P",
-    jobDir,
-    "-o",
-    "%(title).180B [%(id)s].%(ext)s",
-    "-f",
-    format,
-    ...postProcessArgs(type, codec),
-    url
-  ];
+  const attempts = buildAttemptPlan(type);
+  let attemptIndex = 0;
 
-  setJobState(job, {
-    status: "running",
-    message: "Starting yt-dlp...",
-    progress: 0
-  });
-
-  const child = spawn("yt-dlp", args, {
-    cwd: ROOT,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  const stdoutReader = readline.createInterface({ input: child.stdout });
-  const stderrReader = readline.createInterface({ input: child.stderr });
-
-  stdoutReader.on("line", line => handleYtDlpLine(job, line));
-  stderrReader.on("line", line => handleYtDlpLine(job, line));
-
-  child.on("error", err => {
-    setJobState(job, {
-      status: "failed",
-      message: "Failed to start yt-dlp.",
-      error: err.message
+  const runAttempt = () => {
+    const attempt = attempts[attemptIndex];
+    const args = buildYtDlpArgs({
+      url,
+      type,
+      quality,
+      codec,
+      jobDir,
+      transcode: attempt.transcode,
+      useNvidia: attempt.useNvidia
     });
-  });
+    const attemptLines = [];
 
-  child.on("close", code => {
-    stdoutReader.close();
-    stderrReader.close();
+    const startMessage =
+      attempt.label === "fast-remux"
+        ? "Starting yt-dlp..."
+        : attempt.useNvidia
+          ? "Fast remux failed. Retrying with NVIDIA transcoding..."
+          : "Fast remux failed. Retrying with CPU transcoding...";
 
-    if (code !== 0) {
-      if (job.status !== "failed") {
-        setJobState(job, {
-          status: "failed",
-          message: "yt-dlp exited with an error.",
-          error: `Exit code ${code}`
-        });
+    setJobState(job, {
+      status: attempt.label === "fast-remux" ? "running" : "processing",
+      message: startMessage,
+      progress: 0,
+      speed: null,
+      eta: null,
+      totalSize: null
+    });
+
+    const child = spawn("yt-dlp", args, {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    const stdoutReader = readline.createInterface({ input: child.stdout });
+    const stderrReader = readline.createInterface({ input: child.stderr });
+
+    const onLine = line => {
+      const trimmed = String(line || "").trim();
+      if (trimmed) {
+        attemptLines.push(trimmed);
+        if (attemptLines.length > 400) {
+          attemptLines.shift();
+        }
       }
-      return;
-    }
+      handleYtDlpLine(job, line);
+    };
 
-    const filePath = findNewestFile(jobDir);
+    stdoutReader.on("line", onLine);
+    stderrReader.on("line", onLine);
 
-    if (!filePath) {
+    child.on("error", err => {
       setJobState(job, {
         status: "failed",
-        message: "No output file was produced.",
-        error: "yt-dlp completed but no downloadable file was found."
+        message: "Failed to start yt-dlp.",
+        error: err.message
       });
-      return;
-    }
-
-    job.filePath = filePath;
-    appendUserDownloadRecord(ownerUsername, {
-      id,
-      filePath,
-      createdAt: job.createdAt
     });
 
-    setJobState(job, {
-      status: "completed",
-      message: "Download ready.",
-      progress: 100,
-      downloadUrl: `/jobs/${id}/file`
-    });
+    child.on("close", code => {
+      stdoutReader.close();
+      stderrReader.close();
 
-    setTimeout(() => {
-      const existing = jobs.get(id);
-      if (existing && existing.clients.size === 0 && Date.now() - existing.createdAt > 60 * 60 * 1000) {
-        jobs.delete(id);
+      if (code !== 0) {
+        const hasNextAttempt = attemptIndex + 1 < attempts.length;
+        const canRetryFromRemux = !attempt.transcode && shouldRetryWithTranscode(type, attemptLines);
+        const canRetryFromNvidia = attempt.transcode && attempt.useNvidia && hasNextAttempt;
+
+        if (hasNextAttempt && (canRetryFromRemux || canRetryFromNvidia)) {
+          attemptIndex += 1;
+          runAttempt();
+          return;
+        }
+
+        if (job.status !== "failed") {
+          setJobState(job, {
+            status: "failed",
+            message: "yt-dlp exited with an error.",
+            error: `Exit code ${code}`
+          });
+        }
+        return;
       }
-    }, 60 * 60 * 1000);
-  });
+
+      const filePath = findNewestFile(jobDir);
+
+      if (!filePath) {
+        setJobState(job, {
+          status: "failed",
+          message: "No output file was produced.",
+          error: "yt-dlp completed but no downloadable file was found."
+        });
+        return;
+      }
+
+      job.filePath = filePath;
+      const providerThumbPath = findProviderThumbnail(jobDir, filePath);
+      let completedSize = job.totalSize;
+      try {
+        const stat = fs.statSync(filePath);
+        completedSize = formatBinaryBytes(stat.size) || completedSize;
+      } catch {
+        // ignore and keep prior size text
+      }
+
+      appendUserDownloadRecord(ownerUsername, {
+        id,
+        filePath,
+        createdAt: job.createdAt,
+        thumbnailPath: providerThumbPath
+      });
+
+      setJobState(job, {
+        status: "completed",
+        message: "Download ready.",
+        progress: 100,
+        speed: null,
+        eta: null,
+        totalSize: completedSize || "available",
+        thumbnailUrl: `/api/downloads/thumb/${encodeURIComponent(id)}`,
+        downloadUrl: `/jobs/${id}/file`
+      });
+
+      setTimeout(() => {
+        const existing = jobs.get(id);
+        if (existing && existing.clients.size === 0 && Date.now() - existing.createdAt > 60 * 60 * 1000) {
+          jobs.delete(id);
+        }
+      }, 60 * 60 * 1000);
+    });
+  };
+
+  runAttempt();
 
   return id;
 }
@@ -1541,23 +2001,15 @@ function cleanupStaleState() {
   }
 }
 
-function pageForSession(req, res, pagePath) {
-  const session = readValidSession(req);
-  if (!session) {
-    res.sendFile(LOGIN_HTML);
-    return;
-  }
-
-  setSessionCookie(req, res, session.id);
-  res.sendFile(pagePath);
-}
-
-function start() {
+async function start() {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
   fs.mkdirSync(USERS_DOWNLOADS_DIR, { recursive: true });
   loadAccountsFromDisk();
   loadAccessRequestsFromDisk();
-  ensureBundle();
+  const dev = process.env.NODE_ENV !== "production";
+  const nextApp = next({ dev, dir: ROOT, turbopack: false });
+  const nextHandler = nextApp.getRequestHandler();
+  await nextApp.prepare();
 
   const app = express();
   app.set("trust proxy", true);
@@ -1573,21 +2025,36 @@ function start() {
       return;
     }
 
-    const username = String(req.body?.username || "").trim();
+    const loginId = String(req.body?.username || req.body?.email || "").trim();
     const password = String(req.body?.password || "");
-    const normalizedUsername = normalizeUsername(username);
+    const normalizedUsername = normalizeUsername(loginId);
+    const normalizedEmail = normalizeEmail(loginId);
 
     let sessionUsername = "";
 
     const activeAccount = findActiveAccountByUsername(normalizedUsername);
-    if (activeAccount && verifyPasswordHash(password, activeAccount.passwordHash)) {
-      sessionUsername = activeAccount.username;
+    const emailAccount = findActiveAccountByEmail(normalizedEmail);
+    const candidates = [];
+    if (activeAccount) candidates.push(activeAccount);
+    if (emailAccount && (!activeAccount || emailAccount.username !== activeAccount.username)) {
+      candidates.push(emailAccount);
+    }
+
+    const matching = candidates.filter(account => verifyPasswordHash(password, account.passwordHash));
+    if (matching.length === 1) {
+      sessionUsername = matching[0].username;
+    } else if (matching.length > 1) {
+      res.status(409).json({
+        ok: false,
+        error: "Login is ambiguous for this identifier. Use your username."
+      });
+      return;
     }
 
     if (
       !sessionUsername &&
       authConfigured() &&
-      safeEqualString(username, AUTH_USERNAME) &&
+      safeEqualString(loginId, AUTH_USERNAME) &&
       verifyEnvAdminPassword(password)
     ) {
       sessionUsername = AUTH_USERNAME;
@@ -1720,7 +2187,8 @@ function start() {
       return;
     }
 
-    res.send(renderCenteredResultPage("Allowed", "Tab will close in 5 seconds"));
+    const approvedUser = String(record.username || "user").trim() || "user";
+    res.send(renderCenteredResultPage(`Allowed ${approvedUser}`, "Tab will close in 5 seconds"));
   });
 
   app.get("/auth/request-access/review/:id/deny", (req, res) => {
@@ -1734,7 +2202,7 @@ function start() {
       return;
     }
 
-    res.send(`<!doctype html><html><body><form method=\"POST\"><textarea name=\"reason\" rows=\"10\" cols=\"60\"></textarea><input type=\"hidden\" name=\"token\" value=\"${escapeHtml(token)}\" /><button type=\"submit\">Send</button></form></body></html>`);
+    res.send(renderDenyFormPage(token));
   });
 
   app.post("/auth/request-access/review/:id/deny", async (req, res) => {
@@ -1773,26 +2241,48 @@ function start() {
   });
 
   app.get("/", (req, res) => {
-    pageForSession(req, res, APP_HTML);
+    res.setHeader("Cache-Control", "no-store");
+    const session = readValidSession(req);
+    if (!session) {
+      res.redirect("/login");
+      return;
+    }
+    setSessionCookie(req, res, session.id);
+    nextApp.render(req, res, "/index");
   });
 
   app.get("/history", (req, res) => {
-    pageForSession(req, res, HISTORY_HTML);
+    res.setHeader("Cache-Control", "no-store");
+    const session = readValidSession(req);
+    if (!session) {
+      res.redirect("/login");
+      return;
+    }
+    setSessionCookie(req, res, session.id);
+    nextApp.render(req, res, "/history");
   });
 
-  app.get("/app.html", (req, res) => {
-    pageForSession(req, res, APP_HTML);
+  app.get("/login", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const session = readValidSession(req);
+    if (session) {
+      setSessionCookie(req, res, session.id);
+      res.redirect("/");
+      return;
+    }
+    nextApp.render(req, res, "/login");
   });
 
-  app.get("/history.html", (req, res) => {
-    pageForSession(req, res, HISTORY_HTML);
+  app.get("/auth/session", (req, res) => {
+    const session = readValidSession(req);
+    if (!session) {
+      clearSessionCookie(req, res);
+      res.status(401).json({ ok: false, error: "Authentication required." });
+      return;
+    }
+    setSessionCookie(req, res, session.id);
+    res.json({ ok: true, username: session.username });
   });
-
-  app.get("/login", (_req, res) => {
-    res.sendFile(LOGIN_HTML);
-  });
-
-  app.use(express.static(PUBLIC_DIR, { index: false }));
 
   app.get("/api/downloads/history", requireAuth, (req, res) => {
     const status = getUserStorageStatus(req.auth.username);
@@ -1804,7 +2294,8 @@ function start() {
         fileName: entry.fileName,
         sizeBytes: entry.sizeBytes,
         createdAt: entry.createdAt,
-        downloadUrl: `/api/downloads/file/${encodeURIComponent(entry.id)}`
+        downloadUrl: `/api/downloads/file/${encodeURIComponent(entry.id)}`,
+        thumbnailUrl: `/api/downloads/thumb/${encodeURIComponent(entry.id)}`
       })),
       usageBytes: status.usageBytes,
       capBytes: status.capBytes,
@@ -1815,6 +2306,22 @@ function start() {
   app.post("/api/downloads/clear", requireAuth, (req, res) => {
     clearUserDownloads(req.auth.username);
     res.json({ ok: true, message: "All downloads cleared." });
+  });
+
+  app.delete("/api/downloads/item/:id", requireAuth, (req, res) => {
+    const id = String(req.params.id || "").trim();
+    if (!id) {
+      res.status(400).json({ ok: false, error: "Missing file id." });
+      return;
+    }
+
+    const removed = deleteUserDownloadById(req.auth.username, id);
+    if (!removed) {
+      res.status(404).json({ ok: false, error: "File not found." });
+      return;
+    }
+
+    res.json({ ok: true });
   });
 
   app.get("/api/downloads/file/:id", requireAuth, (req, res) => {
@@ -1840,6 +2347,53 @@ function start() {
     }
 
     res.download(absPath, entry.fileName || path.basename(absPath));
+  });
+
+  app.get("/api/downloads/thumb/:id", requireAuth, (req, res) => {
+    const id = String(req.params.id || "").trim();
+    if (!id) {
+      res.status(400).json({ ok: false, error: "Missing file id." });
+      return;
+    }
+
+    const userRoot = getUserRoot(req.auth.username);
+    const entries = pruneUserDownloads(req.auth.username);
+    const entry = entries.find(item => item.id === id);
+
+    if (!entry) {
+      res.status(404).end();
+      return;
+    }
+
+    let thumbnailPath = null;
+    if (entry.thumbnailRelativePath) {
+      thumbnailPath = resolveSafePath(userRoot, entry.thumbnailRelativePath);
+    }
+
+    if (!thumbnailPath || !fs.existsSync(thumbnailPath)) {
+      const mediaPath = resolveSafePath(userRoot, entry.relativePath);
+      if (!mediaPath || !fs.existsSync(mediaPath)) {
+        res.status(404).end();
+        return;
+      }
+
+      const regenerated = ensureThumbnailForFile(userRoot, mediaPath, entry.thumbnailRelativePath);
+      if (!regenerated) {
+        res.status(404).end();
+        return;
+      }
+
+      entry.thumbnailRelativePath = regenerated;
+      saveUserManifest(req.auth.username, entries);
+      thumbnailPath = resolveSafePath(userRoot, regenerated);
+    }
+
+    if (!thumbnailPath || !fs.existsSync(thumbnailPath)) {
+      res.status(404).end();
+      return;
+    }
+
+    res.sendFile(thumbnailPath);
   });
 
   app.post("/download", requireAuth, (req, res) => {
@@ -1940,12 +2494,17 @@ function start() {
     res.json({ ok: true });
   });
 
+  app.use((req, res) => nextHandler(req, res));
+
   setInterval(cleanupStaleState, 5 * 60 * 1000).unref();
 
   app.listen(PORT, () => {
     console.log(`multi-downloader listening on http://localhost:${PORT}`);
     console.log(`session TTL: ${SESSION_TTL_HOURS}h`);
     console.log(`smtp: ${SMTP_HOST}:${SMTP_PORT} secure=${SMTP_SECURE}`);
+    console.log(
+      `video accel: mode=${VIDEO_ACCEL_MODE} nvidia_transcode=${NVIDIA_TRANSCODE_AVAILABLE ? "available" : "unavailable"}`
+    );
     console.log(
       `accounts: active=${activeAccountsByUsername.size} pending=${pendingAccountsById.size}`
     );
@@ -1958,4 +2517,7 @@ function start() {
   });
 }
 
-start();
+start().catch(error => {
+  console.error("Failed to start multi-downloader:", error);
+  process.exit(1);
+});
