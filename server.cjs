@@ -10,8 +10,43 @@ const next = require("next");
 
 const PORT = 4928;
 const ROOT = __dirname;
+const LOCAL_SECRETS_FILE = path.join(ROOT, "local-secrets.txt");
 const DOWNLOADS_DIR = path.join(ROOT, "downloads");
 const USERS_DOWNLOADS_DIR = path.join(DOWNLOADS_DIR, "users");
+
+function loadLocalSecrets(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  let raw = "";
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return;
+  }
+
+  for (const lineRaw of raw.split(/\r?\n/)) {
+    const line = String(lineRaw || "").trim();
+    if (!line || line.startsWith("#")) continue;
+    const normalized = line.startsWith("export ") ? line.slice(7).trim() : line;
+    const idx = normalized.indexOf("=");
+    if (idx <= 0) continue;
+    const key = normalized.slice(0, idx).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+
+    let value = normalized.slice(idx + 1).trim();
+    if (
+      (value.startsWith("\"") && value.endsWith("\"")) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    if (process.env[key] === undefined || process.env[key] === "") {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadLocalSecrets(LOCAL_SECRETS_FILE);
 
 const SESSION_COOKIE = "md_session";
 const SESSION_TTL_HOURS = Math.max(1, Number(process.env.SESSION_TTL_HOURS || 24 * 30));
@@ -24,7 +59,9 @@ const USER_STORAGE_CAP_BYTES = 10 * 1024 * 1024 * 1024;
 
 const LOGIN_RATE_LIMIT = { perMinute: 5, failBlockThreshold: 10, blockForMs: 60 * 60 * 1000 };
 const ACCESS_REQUEST_LIMIT = { per15Minutes: 2, windowMs: 15 * 60 * 1000 };
+const FORGOT_PASSWORD_LIMIT = { per15Minutes: 2, windowMs: 15 * 60 * 1000 };
 const DOWNLOAD_LIMIT = { perMinute: 10, perHour: 25 };
+const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
 
 const AUTH_USERNAME = process.env.AUTH_USERNAME || "";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "";
@@ -36,6 +73,14 @@ const ACCESS_ALERT_TO = process.env.ACCESS_ALERT_TO || "skytheredhead@gmail.com"
 const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
+const ACCESS_REVIEW_BASE_URL = String(process.env.ACCESS_REVIEW_BASE_URL || "").replace(/\/+$/, "");
+const CORS_ALLOWED_ORIGINS = String(
+  process.env.CORS_ALLOWED_ORIGINS ||
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:4928"
+)
+  .split(",")
+  .map(value => value.trim())
+  .filter(Boolean);
 const ACCESS_REQUESTS_FILE = path.join(ROOT, "access-requests.json");
 const USER_ACCOUNTS_FILE = path.join(ROOT, "user-accounts.json");
 const VIDEO_ACCEL_MODE = String(process.env.VIDEO_ACCEL_MODE || "auto").toLowerCase();
@@ -62,9 +107,11 @@ const jobs = new Map();
 const sessions = new Map();
 const loginStateByIp = new Map();
 const accessRequestsByIp = new Map();
+const forgotPasswordEventsByIp = new Map();
 const downloadEventsByIp = new Map();
 const downloadEventsByAccount = new Map();
 const accessRequestById = new Map();
+const passwordResetById = new Map();
 const activeAccountsByUsername = new Map();
 const pendingAccountsById = new Map();
 
@@ -96,6 +143,48 @@ function normalizeIp(raw) {
   if (!value) return "unknown";
   if (value.startsWith("::ffff:")) return value.slice(7);
   return value;
+}
+
+function isAllowedCorsOrigin(origin) {
+  if (!origin) return false;
+  if (CORS_ALLOWED_ORIGINS.includes(origin)) return true;
+  try {
+    const parsed = new URL(origin);
+    return parsed.hostname.endsWith(".vercel.app");
+  } catch {
+    return false;
+  }
+}
+
+function appendVaryHeader(res, key) {
+  const current = String(res.getHeader("Vary") || "");
+  if (!current) {
+    res.setHeader("Vary", key);
+    return;
+  }
+  const parts = current.split(",").map(part => part.trim()).filter(Boolean);
+  if (!parts.includes(key)) {
+    parts.push(key);
+    res.setHeader("Vary", parts.join(", "));
+  }
+}
+
+function applyCors(req, res, next) {
+  const origin = String(req.headers.origin || "");
+  if (isAllowedCorsOrigin(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+    appendVaryHeader(res, "Origin");
+  }
+
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+
+  next();
 }
 
 function getClientIp(req) {
@@ -472,6 +561,47 @@ async function sendDecisionEmailToRequester(record, action, reason = "") {
   }
 }
 
+async function sendPasswordResetEmail(record, meta) {
+  const resetUrl = `${meta.baseUrl}/auth/reset-password/${encodeURIComponent(record.id)}?token=${encodeURIComponent(record.token)}`;
+  const expiresMinutes = Math.max(1, Math.round(PASSWORD_RESET_TOKEN_TTL_MS / (60 * 1000)));
+
+  const text = [
+    "dl.67mc.org password reset",
+    "",
+    `A password reset was requested for username: ${record.username}`,
+    "",
+    `Reset link: ${resetUrl}`,
+    "",
+    `This link expires in ${expiresMinutes} minutes.`
+  ].join("\n");
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;line-height:1.45;color:#111">
+      <p><strong>dl.67mc.org password reset</strong></p>
+      <p>A password reset was requested for <strong>${escapeHtml(record.username)}</strong>.</p>
+      <p>
+        <a href="${resetUrl}" style="display:inline-block;padding:10px 16px;background:#5b21b6;color:#fff;text-decoration:none;border-radius:4px">
+          Reset Password
+        </a>
+      </p>
+      <p style="font-size:13px;color:#555">This link expires in ${expiresMinutes} minutes.</p>
+    </div>
+  `;
+
+  try {
+    await sendMailWithTimeout({
+      from: GMAIL_USER,
+      to: record.email,
+      subject: "dl.67mc.org password reset",
+      text,
+      html
+    });
+  } catch (error) {
+    const detail = error?.message || "Unknown email error";
+    throw new Error(`Unable to send password reset email. ${detail}`);
+  }
+}
+
 function checkDownloadRateLimit({ username, ip }) {
   const now = Date.now();
 
@@ -548,6 +678,7 @@ function makeAccessReviewToken() {
 }
 
 function getRequestBaseUrl(req) {
+  if (ACCESS_REVIEW_BASE_URL) return ACCESS_REVIEW_BASE_URL;
   const protoRaw = String(req.headers["x-forwarded-proto"] || req.protocol || "http");
   const hostRaw = String(req.headers["x-forwarded-host"] || req.headers.host || `localhost:${PORT}`);
   const proto = protoRaw.split(",")[0].trim() || "http";
@@ -707,6 +838,12 @@ function findActiveAccountByEmail(email) {
   return null;
 }
 
+function findActiveAccountByIdentifier(identifier) {
+  const value = String(identifier || "").trim();
+  if (!value) return null;
+  return findActiveAccountByUsername(value) || findActiveAccountByEmail(value);
+}
+
 function hasActiveAccountByEmail(email) {
   return Boolean(findActiveAccountByEmail(email));
 }
@@ -820,6 +957,52 @@ function createAccessRequestRecord({
   saveAccessRequestsToDisk();
 
   return record;
+}
+
+function makePasswordResetToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function purgePasswordResetsForUsername(username) {
+  const normalized = normalizeUsername(username);
+  for (const [id, record] of passwordResetById.entries()) {
+    if (normalizeUsername(record.username) === normalized) {
+      passwordResetById.delete(id);
+    }
+  }
+}
+
+function createPasswordResetRecord(account) {
+  const id = crypto.randomUUID();
+  const token = makePasswordResetToken();
+  const now = Date.now();
+  const record = {
+    id,
+    username: account.username,
+    email: account.email,
+    token,
+    createdAt: now,
+    expiresAt: now + PASSWORD_RESET_TOKEN_TTL_MS
+  };
+  purgePasswordResetsForUsername(account.username);
+  passwordResetById.set(id, record);
+  return record;
+}
+
+function validatePasswordResetToken(record, token) {
+  if (!record) return "Invalid reset request.";
+  if (Date.now() > Number(record.expiresAt || 0)) return "This reset link has expired.";
+  if (!token || !safeEqualString(token, record.token)) return "Invalid reset token.";
+  return null;
+}
+
+function revokeSessionsForUsername(username) {
+  const normalized = normalizeUsername(username);
+  for (const [id, session] of sessions.entries()) {
+    if (normalizeUsername(session.username) === normalized) {
+      sessions.delete(id);
+    }
+  }
 }
 
 function validateAccessReviewToken(record, action, token) {
@@ -943,6 +1126,27 @@ function renderDenyFormPage(token) {
   return renderThemedPage({
     title: "Deny Request",
     body: `<form method="POST"><textarea name="reason" placeholder="Reason..."></textarea><input type="hidden" name="token" value="${escapeHtml(token)}" /><button type="submit">Send</button></form>`
+  });
+}
+
+function renderPasswordResetFormPage({ token }) {
+  return renderThemedPage({
+    title: "Reset Password",
+    body: `
+      <form method="POST">
+        <input
+          type="password"
+          name="password"
+          placeholder="New password"
+          minlength="8"
+          required
+          style="width:100%;height:44px;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:rgba(31,17,50,0.62);color:#efe7ff;padding:0 12px;box-sizing:border-box;outline:none"
+        />
+        <input type="hidden" name="token" value="${escapeHtml(token)}" />
+        <button type="submit" style="margin-top:10px">Update Password</button>
+      </form>
+    `,
+    footer: "Password must be at least 8 characters."
   });
 }
 
@@ -1918,7 +2122,7 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
         eta: null,
         totalSize: completedSize || "available",
         thumbnailUrl: `/api/downloads/thumb/${encodeURIComponent(id)}`,
-        downloadUrl: `/jobs/${id}/file`
+        downloadUrl: `/api/jobs/${id}/file`
       });
 
       setTimeout(() => {
@@ -1955,6 +2159,12 @@ function cleanupStaleState() {
     else accessRequestsByIp.delete(ip);
   }
 
+  for (const [ip, events] of forgotPasswordEventsByIp.entries()) {
+    const fresh = pruneRecent(events, FORGOT_PASSWORD_LIMIT.windowMs, now);
+    if (fresh.length > 0) forgotPasswordEventsByIp.set(ip, fresh);
+    else forgotPasswordEventsByIp.delete(ip);
+  }
+
   for (const [ip, events] of downloadEventsByIp.entries()) {
     const fresh = pruneRecent(events, 60 * 60 * 1000, now);
     if (fresh.length > 0) downloadEventsByIp.set(ip, fresh);
@@ -1965,6 +2175,12 @@ function cleanupStaleState() {
     const fresh = pruneRecent(events, 60 * 60 * 1000, now);
     if (fresh.length > 0) downloadEventsByAccount.set(account, fresh);
     else downloadEventsByAccount.delete(account);
+  }
+
+  for (const [id, record] of passwordResetById.entries()) {
+    if (Number(record.expiresAt || 0) <= now) {
+      passwordResetById.delete(id);
+    }
   }
 
   let accessRequestsChanged = false;
@@ -2022,10 +2238,11 @@ async function start() {
 
   const app = express();
   app.set("trust proxy", true);
+  app.use(applyCors);
   app.use(express.json({ limit: "1mb" }));
   app.use(express.urlencoded({ extended: false, limit: "32kb" }));
 
-  app.post("/auth/login", (req, res) => {
+  app.post(["/auth/login", "/api/auth/login"], (req, res) => {
     const ip = getClientIp(req);
     const rate = checkLoginRate(ip);
 
@@ -2082,7 +2299,7 @@ async function start() {
     res.json({ ok: true });
   });
 
-  app.post("/auth/logout", (req, res) => {
+  app.post(["/auth/logout", "/api/auth/logout"], (req, res) => {
     const cookies = parseCookies(req);
     const sessionId = cookies[SESSION_COOKIE];
     if (sessionId) sessions.delete(sessionId);
@@ -2090,7 +2307,7 @@ async function start() {
     res.json({ ok: true });
   });
 
-  app.post("/auth/request-access", async (req, res) => {
+  app.post(["/auth/request-access", "/api/auth/request-access"], async (req, res) => {
     const ip = getClientIp(req);
     const allowed = consumeWindowLimit(
       accessRequestsByIp,
@@ -2163,6 +2380,88 @@ async function start() {
       }
       res.status(500).json({ ok: false, error: error.message });
     }
+  });
+
+  app.post(["/auth/forgot-password", "/api/auth/forgot-password"], async (req, res) => {
+    const ip = getClientIp(req);
+    const allowed = consumeWindowLimit(
+      forgotPasswordEventsByIp,
+      ip,
+      FORGOT_PASSWORD_LIMIT.per15Minutes,
+      FORGOT_PASSWORD_LIMIT.windowMs
+    );
+
+    if (!allowed) {
+      res.status(429).json({
+        ok: false,
+        error: "Too many forgot-password requests from this IP. Limit is 2 every 15 minutes."
+      });
+      return;
+    }
+
+    const identifier = String(
+      req.body?.identifier || req.body?.username || req.body?.email || ""
+    ).trim();
+
+    const account = findActiveAccountByIdentifier(identifier);
+    if (account) {
+      try {
+        const record = createPasswordResetRecord(account);
+        await sendPasswordResetEmail(record, { baseUrl: getRequestBaseUrl(req) });
+      } catch {
+        // Do not leak account existence or email delivery internals here.
+      }
+    }
+
+    res.json({
+      ok: true,
+      message: "If an account matches that username/email, a reset link has been sent."
+    });
+  });
+
+  app.get("/auth/reset-password/:id", (req, res) => {
+    const id = String(req.params.id || "").trim();
+    const token = String(req.query.token || "");
+    const record = passwordResetById.get(id);
+    const tokenError = validatePasswordResetToken(record, token);
+    if (tokenError) {
+      res.status(400).send(renderSimpleHtmlPage(escapeHtml(tokenError)));
+      return;
+    }
+
+    res.send(renderPasswordResetFormPage({ token }));
+  });
+
+  app.post("/auth/reset-password/:id", (req, res) => {
+    const id = String(req.params.id || "").trim();
+    const token = String(req.body?.token || req.query.token || "");
+    const password = String(req.body?.password || "");
+    const record = passwordResetById.get(id);
+
+    const tokenError = validatePasswordResetToken(record, token);
+    if (tokenError) {
+      res.status(400).send(renderSimpleHtmlPage(escapeHtml(tokenError)));
+      return;
+    }
+
+    if (password.length < 8) {
+      res.status(400).send(renderSimpleHtmlPage("Password must be at least 8 characters."));
+      return;
+    }
+
+    const account = findActiveAccountByUsername(record.username);
+    if (!account) {
+      passwordResetById.delete(id);
+      res.status(404).send(renderSimpleHtmlPage("Account not found."));
+      return;
+    }
+
+    account.passwordHash = hashPasswordForStorage(password);
+    saveAccountsToDisk();
+    revokeSessionsForUsername(account.username);
+    passwordResetById.delete(id);
+
+    res.send(renderSimpleHtmlPage("Password updated. You can return to login."));
   });
 
   app.get("/auth/request-access/review/:id/allow", async (req, res) => {
@@ -2282,7 +2581,7 @@ async function start() {
     nextApp.render(req, res, "/login");
   });
 
-  app.get("/auth/session", (req, res) => {
+  app.get(["/auth/session", "/api/auth/session"], (req, res) => {
     const session = readValidSession(req);
     if (!session) {
       clearSessionCookie(req, res);
@@ -2405,7 +2704,7 @@ async function start() {
     res.sendFile(thumbnailPath);
   });
 
-  app.post("/download", requireAuth, (req, res) => {
+  app.post(["/download", "/api/download"], requireAuth, (req, res) => {
     const validationError = validatePayload(req.body);
     if (validationError) {
       res.status(400).json({ ok: false, error: validationError });
@@ -2440,11 +2739,11 @@ async function start() {
     res.json({
       ok: true,
       jobId,
-      eventsUrl: `/jobs/${jobId}/events`
+      eventsUrl: `/api/jobs/${jobId}/events`
     });
   });
 
-  app.get("/jobs/:id/events", requireAuth, (req, res) => {
+  app.get(["/jobs/:id/events", "/api/jobs/:id/events"], requireAuth, (req, res) => {
     const job = jobs.get(req.params.id);
     if (!job) {
       res.status(404).json({ ok: false, error: "Job not found." });
@@ -2470,7 +2769,7 @@ async function start() {
     });
   });
 
-  app.get("/jobs/:id/file", requireAuth, (req, res) => {
+  app.get(["/jobs/:id/file", "/api/jobs/:id/file"], requireAuth, (req, res) => {
     const job = jobs.get(req.params.id);
     if (!job || job.status !== "completed" || !job.filePath) {
       res.status(404).json({ ok: false, error: "Download not ready." });
@@ -2499,7 +2798,7 @@ async function start() {
     res.download(job.filePath, fileName);
   });
 
-  app.get("/health", (_req, res) => {
+  app.get(["/health", "/api/health"], (_req, res) => {
     res.json({ ok: true });
   });
 

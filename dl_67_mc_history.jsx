@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { backendFetch, backendUrl } from "./frontend-api";
 
 const RETENTION_DAYS = 7;
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -43,7 +44,7 @@ export default function HistoryPage() {
     setError("");
 
     try {
-      const resp = await fetch("/api/downloads/history");
+      const resp = await backendFetch("downloads/history");
 
       if (resp.status === 401) {
         window.location.assign("/login");
@@ -59,7 +60,15 @@ export default function HistoryPage() {
         throw new Error(payload.error || "Failed to load history.");
       }
 
-      setEntries(Array.isArray(payload.entries) ? payload.entries : []);
+      setEntries(
+        Array.isArray(payload.entries)
+          ? payload.entries.map(entry => ({
+            ...entry,
+            downloadUrl: backendUrl(entry.downloadUrl),
+            thumbnailUrl: backendUrl(entry.thumbnailUrl)
+          }))
+          : []
+      );
       setUsageBytes(Number(payload.usageBytes || 0));
       setCapBytes(Number(payload.capBytes || 10 * 1024 * 1024 * 1024));
 
@@ -89,7 +98,7 @@ export default function HistoryPage() {
     }
 
     try {
-      const resp = await fetch("/api/downloads/clear", { method: "POST" });
+      const resp = await backendFetch("downloads/clear", { method: "POST" });
 
       if (resp.status === 401) {
         window.location.assign("/login");
@@ -113,7 +122,7 @@ export default function HistoryPage() {
 
   const logout = async () => {
     try {
-      await fetch("/auth/logout", { method: "POST" });
+      await backendFetch("auth/logout", { method: "POST" });
     } finally {
       window.location.assign("/");
     }
@@ -206,7 +215,7 @@ export default function HistoryPage() {
           position: relative;
           padding: 84px 16px 52px;
           box-sizing: border-box;
-          background: linear-gradient(165deg, #090510 0%, #130a21 58%, #0b0713 100%);
+          background: transparent;
           color: #e7ecef;
           font-family: var(--font-ui);
           overflow-x: hidden;

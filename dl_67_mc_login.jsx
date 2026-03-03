@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { backendFetch } from "./frontend-api";
 
 export default function Login() {
   const [mode, setMode] = useState("login");
@@ -17,7 +18,7 @@ export default function Login() {
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const resp = await fetch(url, {
+      const resp = await backendFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -47,7 +48,7 @@ export default function Login() {
     setNotice("");
 
     try {
-      const { resp, payload } = await postJson("/auth/login", {
+      const { resp, payload } = await postJson("auth/login", {
         username: username.trim(),
         password
       });
@@ -79,7 +80,7 @@ export default function Login() {
     setNotice("");
 
     try {
-      const { payload } = await postJson("/auth/request-access", {
+      const { payload } = await postJson("auth/request-access", {
         username: username.trim(),
         email: email.trim(),
         password
@@ -88,6 +89,36 @@ export default function Login() {
     } catch (error) {
       if (error.name === "AbortError") {
         setNotice("Email request timed out. Check server email settings and try again.");
+      } else {
+        setNotice("Unable to reach server.");
+      }
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const handleForgotPassword = async () => {
+    const identifier = (isLogin ? username : email || username).trim();
+    if (!identifier) {
+      setNotice("Enter your username or email, then click Forgot password.");
+      return;
+    }
+
+    setPending(true);
+    setNotice("");
+
+    try {
+      const { resp, payload } = await postJson("auth/forgot-password", { identifier });
+      if (!resp.ok && payload?.error) {
+        setNotice(payload.error);
+        return;
+      }
+      setNotice(
+        payload?.message || "If an account matches that username/email, a reset link has been sent."
+      );
+    } catch (error) {
+      if (error.name === "AbortError") {
+        setNotice("Request timed out. Please try again.");
       } else {
         setNotice("Unable to reach server.");
       }
@@ -183,6 +214,17 @@ export default function Login() {
             {isLogin ? "Request access" : "Back to login"}
           </button>
 
+          {isLogin && (
+            <button
+              type="button"
+              disabled={pending}
+              className="switch-btn"
+              onClick={handleForgotPassword}
+            >
+              Forgot password?
+            </button>
+          )}
+
           <div className={`notice ${notice ? "show" : ""}`}>{notice || "\u00A0"}</div>
         </div>
       </div>
@@ -195,10 +237,7 @@ export default function Login() {
           justify-content: center;
           padding: 18px 16px;
           box-sizing: border-box;
-          background:
-            radial-gradient(circle at 22% 18%, rgba(76, 45, 121, 0.28), transparent 36%),
-            radial-gradient(circle at 80% 78%, rgba(37, 22, 62, 0.34), transparent 34%),
-            linear-gradient(155deg, #09050f 0%, #120a1f 56%, #0b0713 100%);
+          background: transparent;
           color: #e7ecef;
           font-family: var(--font-ui);
         }

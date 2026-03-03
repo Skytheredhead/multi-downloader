@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import { backendFetch, backendUrl } from "./frontend-api";
 
 const CONTROL_HEIGHT = 48;
 const MAX_TASKS = 50;
@@ -227,7 +228,7 @@ export default function App() {
     }
 
     try {
-      const resp = await fetch("/download", {
+      const resp = await backendFetch("download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request)
@@ -250,7 +251,7 @@ export default function App() {
         );
 
         if (shouldClear) {
-          const clearResp = await fetch("/api/downloads/clear", { method: "POST" });
+          const clearResp = await backendFetch("downloads/clear", { method: "POST" });
           if (!clearResp.ok) {
             throw new Error("Failed to clear storage.");
           }
@@ -283,7 +284,10 @@ export default function App() {
 
       closeStreamFor(localCardId);
 
-      const stream = new EventSource(payload.eventsUrl || `/jobs/${serverId}/events`);
+      const stream = new EventSource(
+        backendUrl(payload.eventsUrl || `/api/jobs/${serverId}/events`),
+        { withCredentials: true }
+      );
       activeStreams.current.set(localCardId, stream);
 
       stream.onmessage = event => {
@@ -294,27 +298,34 @@ export default function App() {
           return;
         }
 
-        updateCard(localCardId, card => ({
-          ...card,
-          status: update.status || card.status,
-          stageText: stageLabel(update.status || card.status),
-          message: update.error
-            ? `${update.message || "Download failed."} ${update.error}`.trim()
-            : update.message || card.message,
-          progress: typeof update.progress === "number" ? update.progress : card.progress,
-          speed: "speed" in update ? update.speed : card.speed,
-          eta: "eta" in update ? update.eta : card.eta,
-          totalSize: "totalSize" in update ? update.totalSize : card.totalSize,
-          thumbnailUrl:
+        updateCard(localCardId, card => {
+          const nextThumb =
             "thumbnailUrl" in update
               ? update.thumbnailUrl
-                ? `${update.thumbnailUrl}${update.thumbnailUrl.includes("?") ? "&" : "?"}t=${Date.now()}`
+                ? (() => {
+                  const resolved = backendUrl(update.thumbnailUrl);
+                  return `${resolved}${resolved.includes("?") ? "&" : "?"}t=${Date.now()}`;
+                })()
                 : null
               : update.status === "completed" && card.serverId
-                ? `/api/downloads/thumb/${encodeURIComponent(card.serverId)}?t=${Date.now()}`
-                : card.thumbnailUrl,
-          downloadUrl: update.downloadUrl || card.downloadUrl
-        }));
+                ? backendUrl(`/api/downloads/thumb/${encodeURIComponent(card.serverId)}?t=${Date.now()}`)
+                : card.thumbnailUrl;
+
+          return {
+            ...card,
+            status: update.status || card.status,
+            stageText: stageLabel(update.status || card.status),
+            message: update.error
+              ? `${update.message || "Download failed."} ${update.error}`.trim()
+              : update.message || card.message,
+            progress: typeof update.progress === "number" ? update.progress : card.progress,
+            speed: "speed" in update ? update.speed : card.speed,
+            eta: "eta" in update ? update.eta : card.eta,
+            totalSize: "totalSize" in update ? update.totalSize : card.totalSize,
+            thumbnailUrl: nextThumb,
+            downloadUrl: update.downloadUrl ? backendUrl(update.downloadUrl) : card.downloadUrl
+          };
+        });
 
         if (update.status === "queued") setStatusLine("Queued...");
         if (update.status === "running") setStatusLine("Downloading...");
@@ -395,7 +406,7 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await fetch("/auth/logout", { method: "POST" });
+      await backendFetch("auth/logout", { method: "POST" });
     } finally {
       window.location.assign("/");
     }
@@ -429,7 +440,7 @@ export default function App() {
 
     const checkSession = async () => {
       try {
-        const resp = await fetch("/auth/session", { cache: "no-store" });
+        const resp = await backendFetch("auth/session", { cache: "no-store" });
         if (!cancelled && resp.status === 401) {
           window.location.assign("/login");
         }
@@ -480,9 +491,6 @@ export default function App() {
   return (
     <>
       <div className="md-page">
-        <div className="noise-layer" />
-        <div className="shade-layer" />
-
         <button className="exit-icon" type="button" aria-label="Exit" title="Exit" onClick={handleLogout}>
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M3 3h9v18H3z" />
@@ -650,26 +658,9 @@ export default function App() {
           min-height: 100vh;
           position: relative;
           overflow-x: hidden;
-          background: linear-gradient(145deg, #06040b 0%, #120a1e 52%, #0a0711 100%);
+          background: transparent;
           color: #e7ecef;
           font-family: var(--font-ui);
-        }
-
-        .noise-layer {
-          position: fixed;
-          inset: 0;
-          pointer-events: none;
-          background: radial-gradient(circle at 14% 18%, rgba(79, 50, 129, 0.45), transparent 46%), radial-gradient(circle at 84% 20%, rgba(52, 29, 95, 0.4), transparent 48%), repeating-linear-gradient(0deg, rgba(255,255,255,0.013), rgba(255,255,255,0.013) 1px, transparent 1px, transparent 4px);
-          opacity: 0.9;
-          z-index: 0;
-        }
-
-        .shade-layer {
-          position: fixed;
-          inset: 0;
-          pointer-events: none;
-          background: rgba(0, 0, 0, 0.23);
-          z-index: 0;
         }
 
         .glass {
