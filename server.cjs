@@ -54,6 +54,8 @@ const VIDEO_THUMBNAIL_EXTS = new Set([
   ".mpg",
   ".mpeg"
 ]);
+const AUDIO_OUTPUT_EXTS = new Set([".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac"]);
+const MEDIA_OUTPUT_EXTS = new Set([...VIDEO_THUMBNAIL_EXTS, ...AUDIO_OUTPUT_EXTS]);
 const IMAGE_THUMBNAIL_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
 
 const jobs = new Map();
@@ -1543,7 +1545,14 @@ function listFilesRecursive(dir) {
 
 function findNewestFile(dir) {
   if (!fs.existsSync(dir)) return null;
-  const files = listFilesRecursive(dir);
+  const files = listFilesRecursive(dir).filter(candidate => {
+    const ext = path.extname(candidate).toLowerCase();
+    if (!MEDIA_OUTPUT_EXTS.has(ext)) return false;
+    const base = path.basename(candidate).toLowerCase();
+    if (base.includes(".part")) return false;
+    if (/\.(f\d+|frag\d+)\./i.test(base)) return false;
+    return true;
+  });
   if (files.length === 0) return null;
 
   let newest = files[0];

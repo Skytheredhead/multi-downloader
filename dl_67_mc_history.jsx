@@ -175,7 +175,13 @@ export default function HistoryPage() {
                   </div>
 
                   <div className="item-actions">
-                    <a href={entry.downloadUrl} className="item-action">Download</a>
+                    <a href={entry.downloadUrl} className="item-action" aria-label="Download" title="Download">
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M12 3v11" />
+                        <path d="M8 10l4 4 4-4" />
+                        <path d="M4 19h16" />
+                      </svg>
+                    </a>
                   </div>
                 </div>
               ))}
@@ -240,7 +246,7 @@ export default function HistoryPage() {
         .history-head {
           display: flex;
           align-items: center;
-          gap: 8px;
+          gap: 14px;
           margin-bottom: 12px;
         }
 
@@ -359,24 +365,23 @@ export default function HistoryPage() {
         }
 
         .item-action {
-          height: 30px;
-          min-width: 58px;
-          border-radius: 8px;
+          width: 34px;
+          height: 34px;
+          border-radius: 9px;
           border: 1px solid rgba(255, 255, 255, 0.18);
           background: rgba(255, 255, 255, 0.08);
           color: #f3edff;
           cursor: pointer;
-          font-size: 12px;
           text-decoration: none;
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          padding: 0 10px;
-          transition: background 0.15s ease;
+          transition: background 0.15s ease, transform 0.15s ease;
         }
 
         .item-action:hover {
           background: rgba(255, 255, 255, 0.16);
+          transform: translateY(-1px);
         }
 
         .bottom-controls {
