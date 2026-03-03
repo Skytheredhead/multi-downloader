@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+public/*.js
+public/*.js.map
+dist/
+build/
+
+# Runtime storage/data
+downloads/
+uploads/
+data/
+storage/
+tmp/
+temp/
+cache/
+.cache/
+*.db
+*.sqlite
+*.sqlite3
+*.sqlitedb
+*.mdb
+*.rdb
+access-requests.json
+user-accounts.json
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.crt
+local-secrets.txt
+
+# Logs / diagnostics
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS/editor noise
+.DS_Store
+.codex/

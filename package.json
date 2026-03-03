@@ -1,0 +1,17 @@
+{
+  "name": "multi-downloader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "esbuild": "^0.25.2",
+    "express": "^5.1.0",
+    "nodemailer": "^7.0.7",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  }
+}
