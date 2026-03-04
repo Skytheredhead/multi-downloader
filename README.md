@@ -18,6 +18,17 @@ cd /Users/skylarenns/Desktop/multi-downloader && brew install node ffmpeg yt-dlp
 cd /path/to/multi-downloader && sudo apt update && sudo apt install -y nodejs npm ffmpeg yt-dlp && npm install && node server.cjs
 ```
 
+###or this cause yeah
+cd ~/Documents/GitHub/multi-downloader && \
+sudo apt update && sudo apt install -y ffmpeg yt-dlp curl && \
+export NVM_DIR="$HOME/.nvm" && \
+[ -s "$NVM_DIR/nvm.sh" ] || curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash && \
+. "$NVM_DIR/nvm.sh" && \
+nvm install 20 && nvm use 20 && \
+npm install && \
+node server.cjs
+
+
 ### Windows (PowerShell + winget)
 
 ```powershell
