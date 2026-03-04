@@ -81,7 +81,7 @@ const DATA_ENCRYPTION_PREFIX = "encv1";
 const ACCESS_REVIEW_BASE_URL = String(process.env.ACCESS_REVIEW_BASE_URL || "").replace(/\/+$/, "");
 const CORS_ALLOWED_ORIGINS = String(
   process.env.CORS_ALLOWED_ORIGINS ||
-    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:4928"
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:4928,https://dl.67mc.org"
 )
   .split(",")
   .map(value => value.trim())

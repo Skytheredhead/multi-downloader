@@ -1,0 +1,14 @@
+# Example cloudflared config
+# Place as /etc/cloudflared/config.yml (or your chosen location)
+
+tunnel: REPLACE_WITH_TUNNEL_ID
+credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_ID.json
+
+ingress:
+  - hostname: dlapi.67mc.org
+    service: http://localhost:4928
+    originRequest:
+      httpHostHeader: dlapi.67mc.org
+      connectTimeout: 30s
+      noTLSVerify: true
+  - service: http_status:404

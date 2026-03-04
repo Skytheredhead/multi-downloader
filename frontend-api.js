@@ -1,4 +1,5 @@
 const DEFAULT_BACKEND_API_PATH = "/api";
+const DEFAULT_PRODUCTION_BACKEND_API_BASE = "https://dlapi.67mc.org/api";
 
 function stripTrailingSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -13,16 +14,21 @@ function parseOrigin(value) {
 }
 
 function runtimeApiBase() {
+  if (process.env.NEXT_PUBLIC_BACKEND_API_BASE) {
+    return process.env.NEXT_PUBLIC_BACKEND_API_BASE;
+  }
+
   if (typeof window !== "undefined" && window.location?.hostname) {
     const host = window.location.hostname.toLowerCase();
     if (host === "localhost" || host === "127.0.0.1") {
       return `${window.location.origin}${DEFAULT_BACKEND_API_PATH}`;
     }
+
+    if (host === "dl.67mc.org" || host === "www.dl.67mc.org" || host.endsWith(".vercel.app")) {
+      return DEFAULT_PRODUCTION_BACKEND_API_BASE;
+    }
   }
 
-  if (process.env.NEXT_PUBLIC_BACKEND_API_BASE) {
-    return process.env.NEXT_PUBLIC_BACKEND_API_BASE;
-  }
   if (typeof window !== "undefined" && window.location?.origin) {
     return `${window.location.origin}${DEFAULT_BACKEND_API_PATH}`;
   }
