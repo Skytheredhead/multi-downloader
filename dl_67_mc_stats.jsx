@@ -41,17 +41,21 @@ function buildPieGradient(counts, order, palette) {
   const total = order.reduce((sum, key) => sum + (Number(counts?.[key] || 0) || 0), 0);
   if (total <= 0) return "rgba(255,255,255,0.08)";
 
+  const slices = order
+    .map(key => ({ key, value: Number(counts?.[key] || 0) || 0 }))
+    .filter(item => item.value > 0);
+  if (slices.length === 0) return "rgba(255,255,255,0.08)";
+
   let start = 0;
   const segments = [];
-  for (const key of order) {
-    const value = Number(counts?.[key] || 0) || 0;
-    if (value <= 0) continue;
-    const end = start + (value / total) * 360;
-    segments.push(`${palette[key]} ${start.toFixed(3)}deg ${end.toFixed(3)}deg`);
+  for (let index = 0; index < slices.length; index += 1) {
+    const slice = slices[index];
+    const isLast = index === slices.length - 1;
+    const end = isLast ? 360 : start + (slice.value / total) * 360;
+    segments.push(`${palette[slice.key]} ${start}deg ${end}deg`);
     start = end;
   }
 
-  if (segments.length === 0) return "rgba(255,255,255,0.08)";
   return `conic-gradient(${segments.join(", ")})`;
 }
 
@@ -452,7 +456,15 @@ export default function StatsPage() {
           width: 132px;
           height: 132px;
           border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.16);
+          border: 0;
+          box-shadow:
+            inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+            0 2px 8px rgba(0, 0, 0, 0.22);
+          transform: translateZ(0);
+          overflow: hidden;
+          isolation: isolate;
+          -webkit-mask-image: radial-gradient(circle, #000 99.2%, transparent 100%);
+          mask-image: radial-gradient(circle, #000 99.2%, transparent 100%);
           margin-bottom: 10px;
         }
 

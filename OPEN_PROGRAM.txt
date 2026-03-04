@@ -1,0 +1,88 @@
+Multi-Downloader: How To Open The Program (macOS / Windows / Linux)
+
+Requirements (all OS):
+- Node.js 20+ (includes npm)
+- yt-dlp installed and available in PATH
+- ffmpeg installed and available in PATH
+
+Project location:
+- Open a terminal in this folder:
+  /Users/skylarenns/Desktop/multi-downloader
+
+--------------------------------------------------
+macOS
+--------------------------------------------------
+1) Open Terminal.
+2) Go to the project folder:
+   cd /Users/skylarenns/Desktop/multi-downloader
+3) Install dependencies (first time or after package changes):
+   npm install
+4) Start the app:
+   node server.cjs
+5) Open in browser:
+   http://localhost:4928
+
+Optional (dev mode with hot reload for Next pages):
+- npm run dev
+
+--------------------------------------------------
+Windows (PowerShell)
+--------------------------------------------------
+1) Open PowerShell.
+2) Go to your project folder (example):
+   cd C:\path\to\multi-downloader
+3) Install dependencies:
+   npm install
+4) Start the app:
+   node server.cjs
+5) Open in browser:
+   http://localhost:4928
+
+If script policy blocks npm scripts:
+- Run PowerShell as Administrator and use:
+  Set-ExecutionPolicy RemoteSigned
+
+--------------------------------------------------
+Linux
+--------------------------------------------------
+1) Open terminal.
+2) Go to the project folder:
+   cd /path/to/multi-downloader
+3) Install dependencies:
+   npm install
+4) Start the app:
+   node server.cjs
+5) Open in browser:
+   http://localhost:4928
+
+--------------------------------------------------
+Run in background (all OS)
+--------------------------------------------------
+- You can use a process manager (example: pm2):
+  npm install -g pm2
+  pm2 start server.cjs --name multi-downloader
+  pm2 save
+
+--------------------------------------------------
+Troubleshooting
+--------------------------------------------------
+- Port already in use (4928):
+  Stop old server process, then run node server.cjs again.
+
+- "yt-dlp not found":
+  Install yt-dlp and ensure it is in PATH.
+
+- "ffmpeg not found":
+  Install ffmpeg and ensure it is in PATH.
+
+- Browser cannot connect to localhost:4928:
+  Confirm server is running in terminal and not blocked by firewall.
+
+--------------------------------------------------
+Cloudflare Tunnel / External Access
+--------------------------------------------------
+- Keep backend running locally on port 4928.
+- Point tunnel to:
+  http://localhost:4928
+- External users access your configured domain.
+

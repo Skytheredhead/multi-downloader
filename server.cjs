@@ -91,6 +91,9 @@ const USER_ACCOUNTS_FILE = path.join(ROOT, "user-accounts.json");
 const STATS_STORE_FILE = path.join(ROOT, "stats-store.json");
 const STATS_MAX_RECORDS = 10000;
 const VIDEO_ACCEL_MODE = String(process.env.VIDEO_ACCEL_MODE || "auto").toLowerCase();
+const DOWNLOAD_PROXY = String(
+  process.env.DOWNLOAD_PROXY || process.env.YTDLP_PROXY || "socks5://127.0.0.1:40000"
+).trim();
 
 const VALID_TYPES = new Set(["a+v", "a", "v"]);
 const VALID_QUALITIES = new Set(["hq", "mq", "lq"]);
@@ -2596,6 +2599,10 @@ function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidi
     format
   ];
 
+  if (DOWNLOAD_PROXY && !/^(none|off|disabled)$/i.test(DOWNLOAD_PROXY)) {
+    args.push("--proxy", DOWNLOAD_PROXY);
+  }
+
   if (!direct) {
     args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
     args.push(...postProcessArgs(type, codec, { transcode, useNvidia }));
@@ -3640,6 +3647,7 @@ async function start() {
     console.log(
       `video accel: mode=${VIDEO_ACCEL_MODE} nvidia_transcode=${NVIDIA_TRANSCODE_AVAILABLE ? "available" : "unavailable"}`
     );
+    console.log(`download proxy: ${DOWNLOAD_PROXY || "none"}`);
     console.log(
       `accounts: active=${activeAccountsByUsername.size} pending=${pendingAccountsById.size}`
     );
