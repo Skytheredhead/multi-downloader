@@ -48,6 +48,12 @@ function loadLocalSecrets(filePath) {
 
 loadLocalSecrets(LOCAL_SECRETS_FILE);
 
+function envNumber(name, fallback, min = 0) {
+  const parsed = Number(process.env[name]);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, parsed);
+}
+
 const SESSION_COOKIE = "md_session";
 const SESSION_TTL_HOURS = Math.max(1, Number(process.env.SESSION_TTL_HOURS || 24 * 30));
 const SESSION_TTL_MS = SESSION_TTL_HOURS * 60 * 60 * 1000;
@@ -94,6 +100,24 @@ const VIDEO_ACCEL_MODE = String(process.env.VIDEO_ACCEL_MODE || "auto").toLowerC
 const DOWNLOAD_PROXY = String(
   process.env.DOWNLOAD_PROXY || process.env.YTDLP_PROXY || "socks5://127.0.0.1:40000"
 ).trim();
+const PROXY_DISABLED_PATTERN = /^(none|off|disabled)$/i;
+const DOWNLOAD_PROXY_ENABLED = Boolean(DOWNLOAD_PROXY && !PROXY_DISABLED_PATTERN.test(DOWNLOAD_PROXY));
+const YTDLP_COOKIES_FILE = String(
+  process.env.YTDLP_COOKIES_FILE || process.env.YOUTUBE_COOKIES_FILE || ""
+).trim();
+const YTDLP_COOKIES_FILE_PATH = YTDLP_COOKIES_FILE
+  ? path.isAbsolute(YTDLP_COOKIES_FILE)
+    ? YTDLP_COOKIES_FILE
+    : path.join(ROOT, YTDLP_COOKIES_FILE)
+  : "";
+const YTDLP_COOKIES_FILE_EXISTS = YTDLP_COOKIES_FILE_PATH ? fs.existsSync(YTDLP_COOKIES_FILE_PATH) : false;
+const YTDLP_COOKIES_FROM_BROWSER = String(process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
+const YTDLP_USER_AGENT = String(process.env.YTDLP_USER_AGENT || "").trim();
+const YTDLP_EXTRACTOR_ARGS = String(process.env.YTDLP_EXTRACTOR_ARGS || "").trim();
+const PROXY_RESTART_CMD = String(process.env.PROXY_RESTART_CMD || "").trim();
+const PROXY_RESTART_TIMEOUT_MS = envNumber("PROXY_RESTART_TIMEOUT_MS", 45000, 1000);
+const PROXY_RESTART_WAIT_MS = envNumber("PROXY_RESTART_WAIT_MS", 5000, 0);
+const PROXY_RESTART_COOLDOWN_MS = envNumber("PROXY_RESTART_COOLDOWN_MS", 45000, 0);
 
 const VALID_TYPES = new Set(["a+v", "a", "v"]);
 const VALID_QUALITIES = new Set(["hq", "mq", "lq"]);
@@ -129,6 +153,8 @@ let statsStore = { downloads: [] };
 let mailTransport = null;
 let warnedMissingDataEncryptionKey = false;
 const NVIDIA_TRANSCODE_AVAILABLE = detectNvidiaTranscodeSupport();
+let proxyRestartInFlight = null;
+let lastProxyRestartAt = 0;
 
 function detectNvidiaTranscodeSupport() {
   if (VIDEO_ACCEL_MODE === "off" || VIDEO_ACCEL_MODE === "none") return false;
@@ -146,6 +172,136 @@ function detectNvidiaTranscodeSupport() {
     return /h264_nvenc/i.test(output) && /hevc_nvenc/i.test(output);
   } catch {
     return false;
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function runShellCommand(command, timeoutMs) {
+  return new Promise(resolve => {
+    let finished = false;
+    let stdout = "";
+    let stderr = "";
+    const maxOutputChars = 4000;
+
+    const child = spawn(command, {
+      cwd: ROOT,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    const done = result => {
+      if (finished) return;
+      finished = true;
+      resolve(result);
+    };
+
+    const appendChunk = (target, chunk) => {
+      const next = `${target}${String(chunk || "")}`;
+      if (next.length <= maxOutputChars) return next;
+      return next.slice(next.length - maxOutputChars);
+    };
+
+    child.stdout.on("data", chunk => {
+      stdout = appendChunk(stdout, chunk);
+    });
+    child.stderr.on("data", chunk => {
+      stderr = appendChunk(stderr, chunk);
+    });
+
+    const timeoutId = setTimeout(() => {
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+      done({
+        ok: false,
+        reason: "timeout",
+        code: null,
+        signal: "SIGTERM",
+        stdout: stdout.trim(),
+        stderr: stderr.trim()
+      });
+    }, timeoutMs);
+    timeoutId.unref();
+
+    child.on("error", error => {
+      clearTimeout(timeoutId);
+      done({
+        ok: false,
+        reason: "spawn_error",
+        code: null,
+        signal: null,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        error: error?.message || "spawn failed"
+      });
+    });
+
+    child.on("close", (code, signal) => {
+      clearTimeout(timeoutId);
+      done({
+        ok: code === 0,
+        reason: code === 0 ? "ok" : "exit_nonzero",
+        code: typeof code === "number" ? code : null,
+        signal: signal || null,
+        stdout: stdout.trim(),
+        stderr: stderr.trim()
+      });
+    });
+  });
+}
+
+async function restartDownloadProxy(reason) {
+  if (!PROXY_RESTART_CMD) {
+    return { ok: false, skipped: true, reason: "not_configured" };
+  }
+
+  if (!DOWNLOAD_PROXY_ENABLED) {
+    return { ok: false, skipped: true, reason: "proxy_disabled" };
+  }
+
+  if (proxyRestartInFlight) {
+    return proxyRestartInFlight;
+  }
+
+  const now = Date.now();
+  if (PROXY_RESTART_COOLDOWN_MS > 0 && now - lastProxyRestartAt < PROXY_RESTART_COOLDOWN_MS) {
+    return { ok: true, skipped: true, reason: "cooldown" };
+  }
+
+  proxyRestartInFlight = (async () => {
+    const run = await runShellCommand(PROXY_RESTART_CMD, PROXY_RESTART_TIMEOUT_MS);
+    if (!run.ok) {
+      return {
+        ok: false,
+        skipped: false,
+        reason: run.reason || "command_failed",
+        code: run.code,
+        signal: run.signal,
+        stderr: run.stderr,
+        stdout: run.stdout,
+        trigger: reason || "unknown"
+      };
+    }
+
+    lastProxyRestartAt = Date.now();
+    if (PROXY_RESTART_WAIT_MS > 0) {
+      await sleep(PROXY_RESTART_WAIT_MS);
+    }
+
+    return {
+      ok: true,
+      skipped: false,
+      reason: "restarted",
+      trigger: reason || "unknown"
+    };
+  })();
+
+  try {
+    return await proxyRestartInFlight;
+  } finally {
+    proxyRestartInFlight = null;
   }
 }
 
@@ -194,6 +350,16 @@ function extractYouTubeVideoId(rawUrl) {
     // ignore URL parse failures
   }
   return "";
+}
+
+function isYouTubeSourceUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    const host = parsed.hostname.toLowerCase();
+    return host === "youtu.be" || host.endsWith("youtube.com");
+  } catch {
+    return false;
+  }
 }
 
 function fallbackRemoteThumbnailUrl(rawUrl) {
@@ -2584,7 +2750,7 @@ function handleYtDlpLine(job, line) {
   }
 }
 
-function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidia, passThrough }) {
+function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidia, passThrough, noProxy }) {
   const direct = Boolean(passThrough);
   const format = direct ? "best" : formatSelector(type, quality, codec);
   const args = [
@@ -2599,8 +2765,22 @@ function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidi
     format
   ];
 
-  if (DOWNLOAD_PROXY && !/^(none|off|disabled)$/i.test(DOWNLOAD_PROXY)) {
+  if (DOWNLOAD_PROXY_ENABLED && !noProxy) {
     args.push("--proxy", DOWNLOAD_PROXY);
+  }
+
+  if (YTDLP_COOKIES_FROM_BROWSER) {
+    args.push("--cookies-from-browser", YTDLP_COOKIES_FROM_BROWSER);
+  } else if (YTDLP_COOKIES_FILE_EXISTS) {
+    args.push("--cookies", YTDLP_COOKIES_FILE_PATH);
+  }
+
+  if (YTDLP_USER_AGENT) {
+    args.push("--user-agent", YTDLP_USER_AGENT);
+  }
+
+  if (YTDLP_EXTRACTOR_ARGS) {
+    args.push("--extractor-args", YTDLP_EXTRACTOR_ARGS);
   }
 
   if (!direct) {
@@ -2610,6 +2790,56 @@ function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidi
 
   args.push(url);
   return args;
+}
+
+function looksLikeYouTubeBotChallenge(lines) {
+  const text = lines.join("\n").toLowerCase();
+  return (
+    text.includes("sign in to confirm you're not a bot") ||
+    text.includes("sign in to confirm you’re not a bot") ||
+    text.includes("use --cookies-from-browser") ||
+    text.includes("use --cookies")
+  );
+}
+
+function buildRetryWithoutProxyAttempt(attempt) {
+  return {
+    ...attempt,
+    noProxy: true,
+    proxyRestarted: attempt.proxyRestarted || false
+  };
+}
+
+function buildRetryAfterProxyRestartAttempt(attempt) {
+  return {
+    ...attempt,
+    noProxy: false,
+    proxyRestarted: true
+  };
+}
+
+function attemptStartMessage(attempt) {
+  if (attempt.proxyRestarted && !attempt.noProxy) {
+    return "Proxy restarted. Retrying...";
+  }
+
+  if (attempt.label === "fast-remux") {
+    return attempt.noProxy ? "Retrying without proxy..." : "Starting yt-dlp...";
+  }
+
+  if (attempt.label === "pass-through") {
+    return attempt.noProxy ? "Retrying with direct download (no proxy)..." : "Retrying with direct download...";
+  }
+
+  if (attempt.useNvidia) {
+    return attempt.noProxy
+      ? "Fast remux failed. Retrying with NVIDIA transcoding (no proxy)..."
+      : "Fast remux failed. Retrying with NVIDIA transcoding...";
+  }
+
+  return attempt.noProxy
+    ? "Fast remux failed. Retrying with CPU transcoding (no proxy)..."
+    : "Fast remux failed. Retrying with CPU transcoding...";
 }
 
 function shouldRetryWithTranscode(type, lines) {
@@ -2627,14 +2857,44 @@ function shouldRetryWithTranscode(type, lines) {
 }
 
 function buildAttemptPlan(type) {
-  const plan = [{ transcode: false, useNvidia: false, passThrough: false, label: "fast-remux" }];
+  const plan = [
+    {
+      transcode: false,
+      useNvidia: false,
+      passThrough: false,
+      noProxy: false,
+      proxyRestarted: false,
+      label: "fast-remux"
+    }
+  ];
   if (type === "a") return plan;
 
   if (NVIDIA_TRANSCODE_AVAILABLE) {
-    plan.push({ transcode: true, useNvidia: true, passThrough: false, label: "gpu-transcode" });
+    plan.push({
+      transcode: true,
+      useNvidia: true,
+      passThrough: false,
+      noProxy: false,
+      proxyRestarted: false,
+      label: "gpu-transcode"
+    });
   }
-  plan.push({ transcode: true, useNvidia: false, passThrough: false, label: "cpu-transcode" });
-  plan.push({ transcode: false, useNvidia: false, passThrough: true, label: "pass-through" });
+  plan.push({
+    transcode: true,
+    useNvidia: false,
+    passThrough: false,
+    noProxy: false,
+    proxyRestarted: false,
+    label: "cpu-transcode"
+  });
+  plan.push({
+    transcode: false,
+    useNvidia: false,
+    passThrough: true,
+    noProxy: false,
+    proxyRestarted: false,
+    label: "pass-through"
+  });
   return plan;
 }
 
@@ -2698,6 +2958,7 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
 
   const attempts = buildAttemptPlan(type);
   let attemptIndex = 0;
+  const sourceIsYouTube = isYouTubeSourceUrl(url);
 
   const runAttempt = () => {
     const attempt = attempts[attemptIndex];
@@ -2709,18 +2970,12 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
       jobDir,
       transcode: attempt.transcode,
       useNvidia: attempt.useNvidia,
-      passThrough: attempt.passThrough
+      passThrough: attempt.passThrough,
+      noProxy: attempt.noProxy
     });
     const attemptLines = [];
 
-    const startMessage =
-      attempt.label === "fast-remux"
-        ? "Starting yt-dlp..."
-        : attempt.label === "pass-through"
-          ? "Retrying with direct download..."
-        : attempt.useNvidia
-          ? "Fast remux failed. Retrying with NVIDIA transcoding..."
-          : "Fast remux failed. Retrying with CPU transcoding...";
+    const startMessage = attemptStartMessage(attempt);
 
     setJobState(job, {
       status: attempt.label === "fast-remux" ? "running" : "processing",
@@ -2766,24 +3021,76 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
       stderrReader.close();
 
       if (code !== 0) {
-        const hasNextAttempt = attemptIndex + 1 < attempts.length;
-        const canRetryFromRemux = !attempt.transcode && shouldRetryWithTranscode(type, attemptLines);
-        const canRetryFromNvidia = attempt.transcode && attempt.useNvidia && hasNextAttempt;
-        const canRetryFromCpu = attempt.transcode && !attempt.useNvidia && hasNextAttempt;
+        const sawBotChallenge = sourceIsYouTube && looksLikeYouTubeBotChallenge(attemptLines);
 
-        if (hasNextAttempt && (canRetryFromRemux || canRetryFromNvidia || canRetryFromCpu)) {
-          attemptIndex += 1;
-          runAttempt();
+        const continueWithDefaultRetryFlow = () => {
+          const canRetryWithoutProxy =
+            sawBotChallenge &&
+            DOWNLOAD_PROXY_ENABLED &&
+            !attempt.noProxy;
+          if (canRetryWithoutProxy) {
+            attempts.splice(attemptIndex + 1, 0, buildRetryWithoutProxyAttempt(attempt));
+            attemptIndex += 1;
+            runAttempt();
+            return true;
+          }
+
+          const hasNextAttempt = attemptIndex + 1 < attempts.length;
+          const canRetryFromRemux = !attempt.transcode && shouldRetryWithTranscode(type, attemptLines);
+          const canRetryFromNvidia = attempt.transcode && attempt.useNvidia && hasNextAttempt;
+          const canRetryFromCpu = attempt.transcode && !attempt.useNvidia && hasNextAttempt;
+
+          if (hasNextAttempt && (canRetryFromRemux || canRetryFromNvidia || canRetryFromCpu)) {
+            attemptIndex += 1;
+            runAttempt();
+            return true;
+          }
+
+          if (job.status !== "failed") {
+            setJobState(job, {
+              status: "failed",
+              message: "yt-dlp exited with an error.",
+              error: `Exit code ${code}`
+            });
+          }
+          return false;
+        };
+
+        const canRestartProxyAndRetry =
+          sawBotChallenge &&
+          DOWNLOAD_PROXY_ENABLED &&
+          !attempt.noProxy &&
+          !attempt.proxyRestarted &&
+          Boolean(PROXY_RESTART_CMD);
+        if (canRestartProxyAndRetry) {
+          setJobState(job, {
+            status: "processing",
+            message: "YouTube bot check hit. Restarting proxy and retrying...",
+            progress: Math.max(0, Number(job.progress) || 0),
+            speed: null,
+            eta: null
+          });
+
+          void restartDownloadProxy("youtube_bot_check")
+            .then(restartResult => {
+              if (restartResult.ok) {
+                attempts.splice(attemptIndex + 1, 0, buildRetryAfterProxyRestartAttempt(attempt));
+                attemptIndex += 1;
+                runAttempt();
+                return;
+              }
+              console.log(
+                `proxy restart failed for job ${id}: ${restartResult.reason || "unknown"}${restartResult.code !== undefined && restartResult.code !== null ? ` code=${restartResult.code}` : ""}`
+              );
+              continueWithDefaultRetryFlow();
+            })
+            .catch(() => {
+              continueWithDefaultRetryFlow();
+            });
           return;
         }
 
-        if (job.status !== "failed") {
-          setJobState(job, {
-            status: "failed",
-            message: "yt-dlp exited with an error.",
-            error: `Exit code ${code}`
-          });
-        }
+        continueWithDefaultRetryFlow();
         return;
       }
 
@@ -3647,7 +3954,25 @@ async function start() {
     console.log(
       `video accel: mode=${VIDEO_ACCEL_MODE} nvidia_transcode=${NVIDIA_TRANSCODE_AVAILABLE ? "available" : "unavailable"}`
     );
-    console.log(`download proxy: ${DOWNLOAD_PROXY || "none"}`);
+    console.log(`download proxy: ${DOWNLOAD_PROXY_ENABLED ? DOWNLOAD_PROXY : "none"}`);
+    if (PROXY_RESTART_CMD) {
+      console.log(
+        `proxy restart: configured (timeout=${PROXY_RESTART_TIMEOUT_MS}ms wait=${PROXY_RESTART_WAIT_MS}ms cooldown=${PROXY_RESTART_COOLDOWN_MS}ms)`
+      );
+    } else {
+      console.log("proxy restart: not configured");
+    }
+    if (YTDLP_COOKIES_FROM_BROWSER) {
+      console.log(`yt-dlp cookies: browser (${YTDLP_COOKIES_FROM_BROWSER})`);
+    } else if (YTDLP_COOKIES_FILE) {
+      if (YTDLP_COOKIES_FILE_EXISTS) {
+        console.log(`yt-dlp cookies: file (${YTDLP_COOKIES_FILE_PATH})`);
+      } else {
+        console.log(`WARNING: YTDLP_COOKIES_FILE not found: ${YTDLP_COOKIES_FILE_PATH}`);
+      }
+    } else {
+      console.log("yt-dlp cookies: none");
+    }
     console.log(
       `accounts: active=${activeAccountsByUsername.size} pending=${pendingAccountsById.size}`
     );

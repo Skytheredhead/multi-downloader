@@ -109,6 +109,49 @@ DOWNLOAD_PROXY=socks5://127.0.0.1:40000
 
 `YTDLP_PROXY` is also accepted as a fallback env var.
 
+## Auto Proxy Reconnect (Bot-Check Recovery)
+
+When YouTube returns "Sign in to confirm you're not a bot", backend retries can optionally restart your proxy/VPN first.
+
+Add this to `local-secrets.txt`:
+
+```txt
+# Example: reconnect your VPN/proxy service
+PROXY_RESTART_CMD=sudo systemctl restart warp-svc
+
+# Optional timing controls (milliseconds)
+PROXY_RESTART_TIMEOUT_MS=45000
+PROXY_RESTART_WAIT_MS=5000
+PROXY_RESTART_COOLDOWN_MS=45000
+```
+
+Notes:
+
+- `PROXY_RESTART_CMD` is not set by default.
+- The command must run non-interactively (no password prompt).
+- On matching YouTube bot-check failures, server will:
+  1) restart proxy once, 2) retry via proxy, 3) retry without proxy.
+
+## YouTube Cookies (Optional)
+
+If YouTube still blocks downloads, configure one auth source:
+
+```txt
+# Option A: Netscape cookies file path
+YTDLP_COOKIES_FILE=/absolute/path/to/youtube-cookies.txt
+
+# Option B: import from browser profile (yt-dlp syntax)
+# YTDLP_COOKIES_FROM_BROWSER=chrome
+```
+
+Optional:
+
+```txt
+# custom request shaping
+# YTDLP_USER_AGENT=Mozilla/5.0 ...
+# YTDLP_EXTRACTOR_ARGS=youtube:player_client=android,web
+```
+
 ## Run
 
 ```bash

@@ -37,6 +37,16 @@ ACCESS_REVIEW_BASE_URL=https://dlapi.67mc.org
 # Default proxy (already defaulted in code, but explicit is clearer)
 DOWNLOAD_PROXY=socks5://127.0.0.1:40000
 
+# Optional: reconnect proxy/VPN on YouTube bot-check failures
+# PROXY_RESTART_CMD=sudo systemctl restart warp-svc
+# PROXY_RESTART_TIMEOUT_MS=45000
+# PROXY_RESTART_WAIT_MS=5000
+# PROXY_RESTART_COOLDOWN_MS=45000
+
+# Optional: YouTube auth cookies for yt-dlp
+# YTDLP_COOKIES_FILE=/absolute/path/to/youtube-cookies.txt
+# YTDLP_COOKIES_FROM_BROWSER=chrome
+
 # Existing auth/email settings should remain here
 # AUTH_USERNAME=...
 # AUTH_PASSWORD_HASH=...

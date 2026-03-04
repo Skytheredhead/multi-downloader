@@ -204,6 +204,14 @@ function friendlyErrorMessage(code, rawMessage = "") {
     return "Secure connection check failed (SSL). Server cert store or system time may be wrong.";
   }
 
+  if (
+    normalized.includes("sign_in_to_confirm_you_re_not_a_bot") ||
+    normalized.includes("cookies_from_browser") ||
+    rawNormalized.includes("sign_in_to_confirm_you_re_not_a_bot")
+  ) {
+    return "YouTube blocked this server route. The backend will retry, but proxy reconnect or YouTube cookies may be required.";
+  }
+
   const map = {
     stream_connection_lost: "Connection to live status was lost.",
     session_expired: "Session expired. Please log in again.",
