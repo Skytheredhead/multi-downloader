@@ -73,6 +73,11 @@ const ACCESS_ALERT_TO = process.env.ACCESS_ALERT_TO || "skytheredhead@gmail.com"
 const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || "false").toLowerCase() === "true";
+const DATA_ENCRYPTION_KEY_RAW = String(process.env.DATA_ENCRYPTION_KEY || "").trim();
+const DATA_ENCRYPTION_KEY = DATA_ENCRYPTION_KEY_RAW
+  ? crypto.createHash("sha256").update(DATA_ENCRYPTION_KEY_RAW).digest()
+  : null;
+const DATA_ENCRYPTION_PREFIX = "encv1";
 const ACCESS_REVIEW_BASE_URL = String(process.env.ACCESS_REVIEW_BASE_URL || "").replace(/\/+$/, "");
 const CORS_ALLOWED_ORIGINS = String(
   process.env.CORS_ALLOWED_ORIGINS ||
@@ -83,6 +88,8 @@ const CORS_ALLOWED_ORIGINS = String(
   .filter(Boolean);
 const ACCESS_REQUESTS_FILE = path.join(ROOT, "access-requests.json");
 const USER_ACCOUNTS_FILE = path.join(ROOT, "user-accounts.json");
+const STATS_STORE_FILE = path.join(ROOT, "stats-store.json");
+const STATS_MAX_RECORDS = 10000;
 const VIDEO_ACCEL_MODE = String(process.env.VIDEO_ACCEL_MODE || "auto").toLowerCase();
 
 const VALID_TYPES = new Set(["a+v", "a", "v"]);
@@ -114,8 +121,10 @@ const accessRequestById = new Map();
 const passwordResetById = new Map();
 const activeAccountsByUsername = new Map();
 const pendingAccountsById = new Map();
+let statsStore = { downloads: [] };
 
 let mailTransport = null;
+let warnedMissingDataEncryptionKey = false;
 const NVIDIA_TRANSCODE_AVAILABLE = detectNvidiaTranscodeSupport();
 
 function detectNvidiaTranscodeSupport() {
@@ -143,6 +152,51 @@ function normalizeIp(raw) {
   if (!value) return "unknown";
   if (value.startsWith("::ffff:")) return value.slice(7);
   return value;
+}
+
+function sourceLabelFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    const host = parsed.hostname.replace(/^www\./i, "");
+    const shortPath = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "";
+    const combined = `${host}${shortPath}`;
+    return combined.length > 160 ? `${combined.slice(0, 157)}...` : combined;
+  } catch {
+    const fallback = String(rawUrl || "").trim();
+    return fallback.length > 160 ? `${fallback.slice(0, 157)}...` : fallback;
+  }
+}
+
+function extractYouTubeVideoId(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    const host = parsed.hostname.toLowerCase();
+
+    if (host === "youtu.be") {
+      const id = parsed.pathname.replace(/^\/+/, "").split("/")[0];
+      return /^[A-Za-z0-9_-]{6,}$/.test(id) ? id : "";
+    }
+
+    if (host.endsWith("youtube.com")) {
+      const watchId = parsed.searchParams.get("v");
+      if (watchId && /^[A-Za-z0-9_-]{6,}$/.test(watchId)) return watchId;
+
+      const parts = parsed.pathname.replace(/^\/+/, "").split("/");
+      if (parts.length >= 2 && (parts[0] === "shorts" || parts[0] === "embed")) {
+        const id = parts[1];
+        return /^[A-Za-z0-9_-]{6,}$/.test(id) ? id : "";
+      }
+    }
+  } catch {
+    // ignore URL parse failures
+  }
+  return "";
+}
+
+function fallbackRemoteThumbnailUrl(rawUrl) {
+  const id = extractYouTubeVideoId(rawUrl);
+  if (!id) return "";
+  return `https://i.ytimg.com/vi/${encodeURIComponent(id)}/hqdefault.jpg`;
 }
 
 function isAllowedCorsOrigin(origin) {
@@ -251,6 +305,55 @@ function safeEqualString(a, b) {
   const right = Buffer.from(String(b || ""));
   if (left.length !== right.length) return false;
   return crypto.timingSafeEqual(left, right);
+}
+
+function encryptStoredValue(input) {
+  const value = String(input || "");
+  if (!DATA_ENCRYPTION_KEY || !value) return value;
+
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", DATA_ENCRYPTION_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return `${DATA_ENCRYPTION_PREFIX}:${iv.toString("base64url")}:${tag.toString("base64url")}:${encrypted.toString("base64url")}`;
+}
+
+function decryptStoredValue(input) {
+  const value = String(input || "");
+  if (!value) return "";
+  if (!value.startsWith(`${DATA_ENCRYPTION_PREFIX}:`)) return value;
+
+  if (!DATA_ENCRYPTION_KEY) {
+    if (!warnedMissingDataEncryptionKey) {
+      console.log("WARNING: encrypted account data detected but DATA_ENCRYPTION_KEY is not set.");
+      warnedMissingDataEncryptionKey = true;
+    }
+    return "";
+  }
+
+  const parts = value.split(":");
+  if (parts.length !== 4) return "";
+
+  try {
+    const iv = Buffer.from(parts[1], "base64url");
+    const tag = Buffer.from(parts[2], "base64url");
+    const encrypted = Buffer.from(parts[3], "base64url");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", DATA_ENCRYPTION_KEY, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    return decrypted.toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function readIdentityField(record, plainKey, encryptedKey) {
+  const plain = String(record?.[plainKey] || "").trim();
+  if (plain) return plain;
+  const encrypted = String(record?.[encryptedKey] || "").trim();
+  if (!encrypted) return "";
+  return String(decryptStoredValue(encrypted) || "").trim();
 }
 
 function normalizeUsername(value) {
@@ -602,6 +705,41 @@ async function sendPasswordResetEmail(record, meta) {
   }
 }
 
+async function sendBugReportEmail(report) {
+  const lines = [
+    "dl.67mc.org bug report",
+    "",
+    `Time: ${new Date().toLocaleString()}`,
+    `User: ${report.username || "unknown"}`,
+    `IP: ${report.ip || "unknown"}`,
+    `Error code: ${report.errorCode || "unknown_error"}`,
+    report.message ? `Message: ${report.message}` : "",
+    report.jobId ? `Job ID: ${report.jobId}` : "",
+    report.url ? `URL: ${report.url}` : "",
+    report.type ? `Type: ${report.type}` : "",
+    report.quality ? `Quality: ${report.quality}` : "",
+    report.codec ? `Codec: ${report.codec}` : "",
+    report.userAgent ? `User-Agent: ${report.userAgent}` : "",
+    "",
+    "Recent actions:",
+    ...(Array.isArray(report.actions) && report.actions.length > 0
+      ? report.actions.map((item, index) => `${index + 1}. ${item}`)
+      : ["(none)"])
+  ].filter(Boolean);
+
+  try {
+    await sendMailWithTimeout({
+      from: GMAIL_USER,
+      to: ACCESS_ALERT_TO,
+      subject: `dl.67mc.org bug report: ${String(report.errorCode || "unknown_error").slice(0, 80)}`,
+      text: lines.join("\n")
+    });
+  } catch (error) {
+    const detail = error?.message || "Unknown email error";
+    throw new Error(`Unable to send bug report email. ${detail}`);
+  }
+}
+
 function checkDownloadRateLimit({ username, ip }) {
   const now = Date.now();
 
@@ -662,6 +800,242 @@ function readJsonFile(filePath, fallback) {
 
 function writeJsonFile(filePath, value) {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
+}
+
+function normalizeQualityValue(value) {
+  const quality = String(value || "").trim().toLowerCase();
+  return VALID_QUALITIES.has(quality) ? quality : "";
+}
+
+function normalizeMediaTypeValue(value) {
+  const mediaType = String(value || "").trim();
+  return VALID_TYPES.has(mediaType) ? mediaType : "";
+}
+
+function formatDurationFromSeconds(value) {
+  const seconds = Number(value || 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0:00";
+  const whole = Math.round(seconds);
+  const h = Math.floor(whole / 3600);
+  const m = Math.floor((whole % 3600) / 60);
+  const s = whole % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function sanitizeStatsEntry(item) {
+  if (!item || typeof item !== "object") return null;
+  const username = normalizeUsername(item.username);
+  const title = String(item.title || "").trim();
+  const sourceUrl = String(item.sourceUrl || "").trim();
+  const mediaType = normalizeMediaTypeValue(item.mediaType) || "a+v";
+  const quality = normalizeQualityValue(item.quality) || "hq";
+  const createdAt = Number(item.createdAt || 0);
+  if (!username || !title || !sourceUrl || !createdAt) return null;
+
+  const durationSecRaw = Number(item.durationSec || 0);
+  const durationSec = Number.isFinite(durationSecRaw) && durationSecRaw > 0 ? durationSecRaw : 0;
+  const sizeBytesRaw = Number(item.sizeBytes || 0);
+  const sizeBytes = Number.isFinite(sizeBytesRaw) && sizeBytesRaw > 0 ? sizeBytesRaw : 0;
+  const avgSpeedMBpsRaw = Number(item.avgSpeedMBps || 0);
+  const maxSpeedMBpsRaw = Number(item.maxSpeedMBps || 0);
+  const minSpeedMBpsRaw = Number(item.minSpeedMBps || 0);
+  const avgSpeedMBps = Number.isFinite(avgSpeedMBpsRaw) && avgSpeedMBpsRaw > 0 ? avgSpeedMBpsRaw : 0;
+  const maxSpeedMBps = Number.isFinite(maxSpeedMBpsRaw) && maxSpeedMBpsRaw > 0 ? maxSpeedMBpsRaw : 0;
+  const minSpeedMBps = Number.isFinite(minSpeedMBpsRaw) && minSpeedMBpsRaw > 0 ? minSpeedMBpsRaw : 0;
+
+  return {
+    username,
+    title: title.slice(0, 240),
+    sourceUrl: sourceUrl.slice(0, 1200),
+    mediaType,
+    quality,
+    durationSec,
+    sizeBytes,
+    avgSpeedMBps,
+    maxSpeedMBps,
+    minSpeedMBps,
+    createdAt
+  };
+}
+
+function loadStatsFromDisk() {
+  const data = readJsonFile(STATS_STORE_FILE, { downloads: [] });
+  const rawDownloads = Array.isArray(data?.downloads) ? data.downloads : [];
+  const sanitized = rawDownloads
+    .map(sanitizeStatsEntry)
+    .filter(Boolean)
+    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    .slice(0, STATS_MAX_RECORDS);
+
+  statsStore = { downloads: sanitized };
+}
+
+function saveStatsToDisk() {
+  const downloads = Array.isArray(statsStore?.downloads) ? statsStore.downloads : [];
+  writeJsonFile(STATS_STORE_FILE, { downloads: downloads.slice(0, STATS_MAX_RECORDS) });
+}
+
+function recordDownloadStat({
+  username,
+  title,
+  sourceUrl,
+  mediaType,
+  quality,
+  durationSec,
+  sizeBytes,
+  avgSpeedMBps,
+  maxSpeedMBps,
+  minSpeedMBps,
+  createdAt
+}) {
+  const entry = sanitizeStatsEntry({
+    username,
+    title,
+    sourceUrl,
+    mediaType,
+    quality,
+    durationSec,
+    sizeBytes,
+    avgSpeedMBps,
+    maxSpeedMBps,
+    minSpeedMBps,
+    createdAt
+  });
+  if (!entry) return;
+
+  const prior = Array.isArray(statsStore?.downloads) ? statsStore.downloads : [];
+  statsStore.downloads = [entry, ...prior].slice(0, STATS_MAX_RECORDS);
+  saveStatsToDisk();
+}
+
+function buildStatsSnapshot() {
+  const downloads = Array.isArray(statsStore?.downloads) ? statsStore.downloads : [];
+  const sorted = [...downloads].sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+  const now = Date.now();
+
+  const typeCounts = { a: 0, v: 0, "a+v": 0 };
+  const qualityCounts = { hq: 0, mq: 0, lq: 0 };
+  const leaderboard = new Map();
+  const userRecent = new Map();
+  const domains = new Map();
+  const uniqueUsers = new Set();
+  let totalSizeBytes = 0;
+  let speedAverageSum = 0;
+  let speedAverageCount = 0;
+  let topDownloadSpeedMBps = 0;
+  let lowestDownloadSpeedMBps = 0;
+  let last24hDownloads = 0;
+  let last7dDownloads = 0;
+  let last30dDownloads = 0;
+
+  for (const item of sorted) {
+    const type = normalizeMediaTypeValue(item.mediaType) || "a+v";
+    const quality = normalizeQualityValue(item.quality) || "hq";
+    typeCounts[type] = (typeCounts[type] || 0) + 1;
+    qualityCounts[quality] = (qualityCounts[quality] || 0) + 1;
+    totalSizeBytes += Number(item.sizeBytes || 0);
+    const avgSpeed = Number(item.avgSpeedMBps || 0);
+    const maxSpeed = Number(item.maxSpeedMBps || 0);
+    const minSpeed = Number(item.minSpeedMBps || 0);
+    if (avgSpeed > 0) {
+      speedAverageSum += avgSpeed;
+      speedAverageCount += 1;
+    }
+    if (maxSpeed > 0) {
+      topDownloadSpeedMBps = Math.max(topDownloadSpeedMBps, maxSpeed);
+    }
+    if (minSpeed > 0) {
+      if (lowestDownloadSpeedMBps <= 0) lowestDownloadSpeedMBps = minSpeed;
+      else lowestDownloadSpeedMBps = Math.min(lowestDownloadSpeedMBps, minSpeed);
+    }
+
+    const createdAt = Number(item.createdAt || 0);
+    if (createdAt > 0) {
+      if (now - createdAt <= 24 * 60 * 60 * 1000) last24hDownloads += 1;
+      if (now - createdAt <= 7 * 24 * 60 * 60 * 1000) last7dDownloads += 1;
+      if (now - createdAt <= 30 * 24 * 60 * 60 * 1000) last30dDownloads += 1;
+    }
+
+    const username = normalizeUsername(item.username);
+    if (username) {
+      uniqueUsers.add(username);
+      leaderboard.set(username, (leaderboard.get(username) || 0) + 1);
+      if (!userRecent.has(username)) userRecent.set(username, createdAt);
+    }
+
+    try {
+      const host = new URL(String(item.sourceUrl || "")).hostname.replace(/^www\./i, "").toLowerCase();
+      if (host) domains.set(host, (domains.get(host) || 0) + 1);
+    } catch {
+      // ignore bad URLs in historical stats
+    }
+  }
+
+  const videoDurationSamples = sorted
+    .filter(item => {
+      const type = normalizeMediaTypeValue(item.mediaType) || "a+v";
+      return (type === "v" || type === "a+v") && Number(item.durationSec || 0) > 0;
+    })
+    .map(item => Number(item.durationSec || 0));
+
+  const averageVideoLengthSec = videoDurationSamples.length
+    ? videoDurationSamples.reduce((sum, value) => sum + value, 0) / videoDurationSamples.length
+    : 0;
+  const averageDownloadSizeBytes = sorted.length ? totalSizeBytes / sorted.length : 0;
+  const averageDownloadSpeedMBps = speedAverageCount > 0 ? speedAverageSum / speedAverageCount : 0;
+
+  const last10 = sorted
+    .filter(item => {
+      const type = normalizeMediaTypeValue(item.mediaType) || "a+v";
+      return type === "v" || type === "a+v";
+    })
+    .slice(0, 10)
+    .map(item => ({
+      title: item.title,
+      sourceUrl: item.sourceUrl,
+      username: item.username,
+      mediaType: item.mediaType,
+      quality: item.quality,
+      durationSec: Number(item.durationSec || 0),
+      createdAt: Number(item.createdAt || 0)
+    }));
+
+  const topUsers = Array.from(leaderboard.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 10)
+    .map(([username, count]) => ({ username, count }));
+
+  const mostRecentlyUsedUsers = Array.from(userRecent.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 10)
+    .map(([username, lastAt]) => ({ username, lastAt }));
+
+  const topDomains = Array.from(domains.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 10)
+    .map(([domain, count]) => ({ domain, count }));
+
+  return {
+    totalDownloads: sorted.length,
+    uniqueUsers: uniqueUsers.size,
+    totalSizeBytes,
+    averageDownloadSizeBytes,
+    averageDownloadSpeedMBps,
+    topDownloadSpeedMBps,
+    lowestDownloadSpeedMBps,
+    last24hDownloads,
+    last7dDownloads,
+    last30dDownloads,
+    averageVideoLengthSec,
+    averageVideoLengthLabel: formatDurationFromSeconds(averageVideoLengthSec),
+    last10Downloads: last10,
+    topUsers,
+    mostRecentlyUsedUsers,
+    topDomains,
+    mediaTypeCounts: typeCounts,
+    qualityCounts
+  };
 }
 
 function escapeHtml(input) {
@@ -748,12 +1122,13 @@ function loadAccessRequestsFromDisk() {
   for (const item of records) {
     if (!item || typeof item !== "object") continue;
     const id = String(item.id || "").trim();
-    const email = String(item.email || "").trim();
+    const email = normalizeEmail(readIdentityField(item, "email", "emailEnc"));
+    const username = normalizeUsername(readIdentityField(item, "username", "usernameEnc"));
     if (!id || !email) continue;
 
     accessRequestById.set(id, {
       id,
-      username: String(item.username || "").trim(),
+      username,
       email,
       pendingAccountId: String(item.pendingAccountId || ""),
       ip: String(item.ip || "unknown"),
@@ -772,7 +1147,22 @@ function loadAccessRequestsFromDisk() {
 function saveAccessRequestsToDisk() {
   const records = Array.from(accessRequestById.values())
     .sort((a, b) => Number(b.requestTime || 0) - Number(a.requestTime || 0))
-    .slice(0, 1000);
+    .slice(0, 1000)
+    .map(record => ({
+      id: record.id,
+      usernameEnc: encryptStoredValue(record.username),
+      emailEnc: encryptStoredValue(record.email),
+      pendingAccountId: String(record.pendingAccountId || ""),
+      ip: String(record.ip || "unknown"),
+      userAgent: String(record.userAgent || ""),
+      requestTime: Number(record.requestTime || 0),
+      status: String(record.status || "pending"),
+      reviewTime: Number(record.reviewTime || 0),
+      reviewReason: String(record.reviewReason || ""),
+      allowToken: String(record.allowToken || ""),
+      denyToken: String(record.denyToken || ""),
+      tokenExpiresAt: Number(record.tokenExpiresAt || 0)
+    }));
   writeJsonFile(ACCESS_REQUESTS_FILE, records);
 }
 
@@ -786,8 +1176,8 @@ function loadAccountsFromDisk() {
 
   for (const item of active) {
     if (!item || typeof item !== "object") continue;
-    const username = normalizeUsername(item.username);
-    const email = normalizeEmail(item.email);
+    const username = normalizeUsername(readIdentityField(item, "username", "usernameEnc"));
+    const email = normalizeEmail(readIdentityField(item, "email", "emailEnc"));
     const passwordHash = String(item.passwordHash || "");
     if (!username || !email || !passwordHash) continue;
 
@@ -804,8 +1194,8 @@ function loadAccountsFromDisk() {
   for (const item of pending) {
     if (!item || typeof item !== "object") continue;
     const id = String(item.id || "").trim();
-    const username = normalizeUsername(item.username);
-    const email = normalizeEmail(item.email);
+    const username = normalizeUsername(readIdentityField(item, "username", "usernameEnc"));
+    const email = normalizeEmail(readIdentityField(item, "email", "emailEnc"));
     const passwordHash = String(item.passwordHash || "");
     if (!id || !username || !email || !passwordHash) continue;
 
@@ -821,8 +1211,22 @@ function loadAccountsFromDisk() {
 }
 
 function saveAccountsToDisk() {
-  const active = Array.from(activeAccountsByUsername.values());
-  const pending = Array.from(pendingAccountsById.values());
+  const active = Array.from(activeAccountsByUsername.values()).map(account => ({
+    id: String(account.id || crypto.randomUUID()),
+    usernameEnc: encryptStoredValue(account.username),
+    emailEnc: encryptStoredValue(account.email),
+    passwordHash: String(account.passwordHash || ""),
+    createdAt: Number(account.createdAt || Date.now()),
+    approvedAt: Number(account.approvedAt || Date.now())
+  }));
+  const pending = Array.from(pendingAccountsById.values()).map(account => ({
+    id: String(account.id || crypto.randomUUID()),
+    usernameEnc: encryptStoredValue(account.username),
+    emailEnc: encryptStoredValue(account.email),
+    passwordHash: String(account.passwordHash || ""),
+    createdAt: Number(account.createdAt || Date.now()),
+    requestId: String(account.requestId || "")
+  }));
   writeJsonFile(USER_ACCOUNTS_FILE, { active, pending });
 }
 
@@ -1240,6 +1644,14 @@ function toUserRelativePath(userRoot, absPath) {
 
 function ensureThumbnailForFile(userRoot, absPath, preferredRelativePath = "") {
   const ext = path.extname(absPath).toLowerCase();
+  const existing = preferredRelativePath
+    ? resolveSafePath(userRoot, preferredRelativePath)
+    : null;
+
+  // Preserve provider-supplied thumbnails (important for audio-only downloads).
+  if (existing && fs.existsSync(existing)) {
+    return preferredRelativePath;
+  }
 
   if (IMAGE_THUMBNAIL_EXTS.has(ext)) {
     return toUserRelativePath(userRoot, absPath);
@@ -1247,13 +1659,6 @@ function ensureThumbnailForFile(userRoot, absPath, preferredRelativePath = "") {
 
   if (!VIDEO_THUMBNAIL_EXTS.has(ext)) {
     return "";
-  }
-
-  const existing = preferredRelativePath
-    ? resolveSafePath(userRoot, preferredRelativePath)
-    : null;
-  if (existing && fs.existsSync(existing)) {
-    return preferredRelativePath;
   }
 
   const parsed = path.parse(absPath);
@@ -1288,6 +1693,99 @@ function ensureThumbnailForFile(userRoot, absPath, preferredRelativePath = "") {
   }
 
   return "";
+}
+
+function createAudioCoverWithIcon(sourceImagePath) {
+  if (!sourceImagePath || !fs.existsSync(sourceImagePath)) return "";
+  const parsed = path.parse(sourceImagePath);
+  const outputPath = path.join(parsed.dir, `${parsed.name}.audio-cover.jpg`);
+  const filterGraph =
+    "eq=brightness=-0.18:saturation=0.9,drawtext=text='♪':fontcolor=white:fontsize=h*0.24:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.9:shadowx=4:shadowy=4";
+
+  try {
+    const run = spawnSync(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        sourceImagePath,
+        "-vf",
+        filterGraph,
+        "-q:v",
+        "2",
+        outputPath
+      ],
+      { cwd: ROOT, timeout: 20000 }
+    );
+
+    if (run.status === 0 && fs.existsSync(outputPath)) {
+      return outputPath;
+    }
+  } catch {
+    // ignore cover render failures
+  }
+
+  return "";
+}
+
+function embedMp3CoverArt(audioPath, coverPath) {
+  if (!audioPath || !coverPath) return false;
+  if (!fs.existsSync(audioPath) || !fs.existsSync(coverPath)) return false;
+
+  const parsed = path.parse(audioPath);
+  const tempOut = path.join(parsed.dir, `${parsed.name}.covertmp${parsed.ext}`);
+
+  try {
+    const run = spawnSync(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        audioPath,
+        "-i",
+        coverPath,
+        "-map",
+        "0:a:0",
+        "-map",
+        "1:v:0",
+        "-c:a",
+        "copy",
+        "-c:v",
+        "mjpeg",
+        "-id3v2_version",
+        "3",
+        "-metadata:s:v",
+        "title=Album cover",
+        "-metadata:s:v",
+        "comment=Cover (front)",
+        "-disposition:v:0",
+        "attached_pic",
+        tempOut
+      ],
+      { cwd: ROOT, timeout: 30000 }
+    );
+
+    if (run.status === 0 && fs.existsSync(tempOut)) {
+      fs.renameSync(tempOut, audioPath);
+      return true;
+    }
+  } catch {
+    // ignore embed failures
+  }
+
+  try {
+    if (fs.existsSync(tempOut)) fs.rmSync(tempOut, { force: true });
+  } catch {
+    // ignore cleanup issues
+  }
+
+  return false;
 }
 
 function cleanupEmptyParents(startDir, stopDir) {
@@ -1338,6 +1836,10 @@ function pruneUserDownloads(username) {
     const fileName = String(entry.fileName || "").trim();
     const relativePath = String(entry.relativePath || "").trim();
     const thumbnailRelativePath = String(entry.thumbnailRelativePath || "").trim();
+    const sourceUrl = String(entry.sourceUrl || "").trim();
+    const mediaTypeRaw = String(entry.mediaType || "").trim();
+    const qualityRaw = String(entry.quality || "").trim();
+    const titleRaw = String(entry.title || "").trim();
     const createdAt = Number(entry.createdAt || 0);
 
     if (!id || !relativePath || !createdAt) {
@@ -1392,7 +1894,12 @@ function pruneUserDownloads(username) {
       relativePath,
       sizeBytes,
       createdAt,
-      thumbnailRelativePath: finalThumbnailRelativePath
+      thumbnailRelativePath: finalThumbnailRelativePath,
+      externalThumbnailUrl: String(entry.externalThumbnailUrl || "").trim(),
+      sourceUrl,
+      mediaType: VALID_TYPES.has(mediaTypeRaw) ? mediaTypeRaw : inferMediaTypeFromPath(absPath),
+      quality: VALID_QUALITIES.has(qualityRaw) ? qualityRaw : "hq",
+      title: titleRaw || displayTitleFromFilename(fileName || path.basename(absPath))
     });
   }
 
@@ -1417,7 +1924,20 @@ function getUserStorageStatus(username) {
   };
 }
 
-function appendUserDownloadRecord(username, { id, filePath, createdAt, thumbnailPath = "" }) {
+function appendUserDownloadRecord(
+  username,
+  {
+    id,
+    filePath,
+    createdAt,
+    thumbnailPath = "",
+    externalThumbnailUrl = "",
+    sourceUrl = "",
+    mediaType = "",
+    quality = "",
+    title = ""
+  }
+) {
   const userRoot = getUserRoot(username);
   const relativePath = path.relative(userRoot, filePath).split(path.sep).join("/");
   if (!relativePath || relativePath.startsWith("..")) return false;
@@ -1446,7 +1966,12 @@ function appendUserDownloadRecord(username, { id, filePath, createdAt, thumbnail
     relativePath,
     sizeBytes,
     createdAt,
-    thumbnailRelativePath
+    thumbnailRelativePath,
+    externalThumbnailUrl: String(externalThumbnailUrl || "").trim(),
+    sourceUrl: String(sourceUrl || "").trim(),
+    mediaType: mediaType && VALID_TYPES.has(mediaType) ? mediaType : inferMediaTypeFromPath(filePath),
+    quality: VALID_QUALITIES.has(quality) ? quality : "hq",
+    title: String(title || "").trim() || displayTitleFromFilename(path.basename(filePath))
   });
   saveUserManifest(username, entries);
   return true;
@@ -1522,9 +2047,9 @@ function videoSelectorsForQuality(quality, codec) {
 
   if (quality === "mq") {
     return [
-      withFilter("bestvideo[height<=1080]", codecFilter),
-      "bestvideo[height<=1080]",
-      "best[height<=1080]"
+      withFilter("bestvideo[height<=720]", codecFilter),
+      "bestvideo[height<=720]",
+      "best[height<=720]"
     ];
   }
 
@@ -1610,6 +2135,7 @@ function postProcessArgs(type, codec, options = {}) {
         "-x",
         "--audio-format",
         "mp3",
+        "--embed-thumbnail",
         "--postprocessor-args",
         "ffmpeg:-b:a 320k"
       );
@@ -1620,6 +2146,7 @@ function postProcessArgs(type, codec, options = {}) {
       "-x",
       "--audio-format",
       "mp3",
+      "--embed-thumbnail",
       "--postprocessor-args",
       "ffmpeg:-b:a 128k"
     );
@@ -1715,7 +2242,13 @@ function setJobState(job, patch) {
     speed: "speed" in patch ? patch.speed : job.speed,
     eta: "eta" in patch ? patch.eta : job.eta,
     totalSize: "totalSize" in patch ? patch.totalSize : job.totalSize,
-    thumbnailUrl: "thumbnailUrl" in patch ? patch.thumbnailUrl : job.thumbnailUrl
+    thumbnailUrl: "thumbnailUrl" in patch ? patch.thumbnailUrl : job.thumbnailUrl,
+    title: "title" in patch ? patch.title : job.title,
+    url: job.url,
+    type: job.type,
+    quality: job.quality,
+    codec: job.codec,
+    createdAt: job.createdAt
   };
 
   job.status = next.status;
@@ -1727,6 +2260,7 @@ function setJobState(job, patch) {
   job.eta = next.eta;
   job.totalSize = next.totalSize;
   job.thumbnailUrl = next.thumbnailUrl;
+  job.title = next.title;
 
   emitJobUpdate(job, next);
 }
@@ -1747,23 +2281,61 @@ function listFilesRecursive(dir) {
   return result;
 }
 
+function isPartialTempFile(filePath) {
+  const base = path.basename(filePath).toLowerCase();
+  if (base.includes(".part")) return true;
+  if (/\.(f\d+|frag\d+)\./i.test(base)) return true;
+  return false;
+}
+
+function isLikelyAuxiliaryImage(filePath) {
+  const lowerName = path.parse(filePath).name.toLowerCase();
+  if (lowerName.endsWith(".thumb")) return true;
+  if (/(^|[-_.])(maxresdefault|hqdefault|mqdefault|sddefault|thumbnail|thumb|sprite|poster)([-_.]|$)/i.test(lowerName)) {
+    return true;
+  }
+  return false;
+}
+
 function findNewestFile(dir) {
   if (!fs.existsSync(dir)) return null;
-  const files = listFilesRecursive(dir).filter(candidate => {
+  const files = listFilesRecursive(dir).filter(candidate => !isPartialTempFile(candidate));
+  const primary = files.filter(candidate => {
     const ext = path.extname(candidate).toLowerCase();
-    if (!MEDIA_OUTPUT_EXTS.has(ext)) return false;
-    const base = path.basename(candidate).toLowerCase();
-    if (base.includes(".part")) return false;
-    if (/\.(f\d+|frag\d+)\./i.test(base)) return false;
-    return true;
+    return MEDIA_OUTPUT_EXTS.has(ext);
   });
-  if (files.length === 0) return null;
 
-  let newest = files[0];
+  const pool = primary.length > 0
+    ? primary
+    : files.filter(candidate => IMAGE_THUMBNAIL_EXTS.has(path.extname(candidate).toLowerCase()));
+
+  if (pool.length === 0) return null;
+
+  if (primary.length === 0) {
+    const ranked = pool
+      .map(candidate => {
+        let size = 0;
+        let mtime = 0;
+        try {
+          const stat = fs.statSync(candidate);
+          size = stat.size;
+          mtime = stat.mtimeMs;
+        } catch {
+          // ignore stat issues and keep defaults
+        }
+        const auxPenalty = isLikelyAuxiliaryImage(candidate) ? 10 * 1024 * 1024 : 0;
+        return { candidate, score: size - auxPenalty, mtime };
+      })
+      .sort((a, b) => b.score - a.score || b.mtime - a.mtime);
+
+    return ranked[0]?.candidate || null;
+  }
+
+  let newest = pool[0];
   let newestMtime = fs.statSync(newest).mtimeMs;
 
-  for (let i = 1; i < files.length; i += 1) {
-    const candidate = files[i];
+  for (let i = 1; i < pool.length; i += 1) {
+    const candidate = pool[i];
     const mtime = fs.statSync(candidate).mtimeMs;
     if (mtime > newestMtime) {
       newest = candidate;
@@ -1814,6 +2386,30 @@ function parseProgress(line) {
   return Math.max(0, Math.min(100, raw));
 }
 
+function parseSpeedMBps(speedText) {
+  const text = String(speedText || "").trim();
+  if (!text) return 0;
+  const match = text.match(/^([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?i?B)\/s$/i);
+  if (!match) return 0;
+
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  const unit = String(match[2] || "B").toUpperCase();
+  const factorByUnit = {
+    B: 1,
+    KIB: 1024,
+    MIB: 1024 * 1024,
+    GIB: 1024 * 1024 * 1024,
+    TIB: 1024 * 1024 * 1024 * 1024,
+    KB: 1000,
+    MB: 1000 * 1000,
+    GB: 1000 * 1000 * 1000,
+    TB: 1000 * 1000 * 1000 * 1000
+  };
+  const bytesPerSecond = value * (factorByUnit[unit] || 1);
+  return bytesPerSecond / (1000 * 1000);
+}
+
 function parseDownloadStats(line) {
   const speedMatch = line.match(/\sat\s+([0-9.]+\s*[KMGTP]?i?B\/s)/i);
   const etaMatch = line.match(/\sETA\s+([0-9:]+)/i);
@@ -1843,6 +2439,56 @@ function formatBinaryBytes(bytes) {
   return `${amount.toFixed(precision)}${units[unitIndex]}`;
 }
 
+function stripFileExt(fileName) {
+  const base = String(fileName || "").trim();
+  const idx = base.lastIndexOf(".");
+  if (idx <= 0) return base;
+  return base.slice(0, idx);
+}
+
+function stripYtDlpIdSuffix(name) {
+  return String(name || "").replace(/\s+\[[A-Za-z0-9_-]{6,}\]\s*$/u, "").trim();
+}
+
+function displayTitleFromFilename(fileName) {
+  const withoutExt = stripFileExt(fileName);
+  const cleaned = stripYtDlpIdSuffix(withoutExt);
+  return cleaned || withoutExt || String(fileName || "").trim();
+}
+
+function inferMediaTypeFromPath(filePath) {
+  const ext = path.extname(String(filePath || "")).toLowerCase();
+  if (AUDIO_OUTPUT_EXTS.has(ext)) return "a";
+  return "a+v";
+}
+
+function probeMediaDurationSeconds(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return 0;
+  try {
+    const probe = spawnSync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        filePath
+      ],
+      { cwd: ROOT, encoding: "utf8", timeout: 12000 }
+    );
+
+    if (probe.status !== 0) return 0;
+    const raw = String(probe.stdout || "").trim();
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+    return parsed;
+  } catch {
+    return 0;
+  }
+}
+
 function handleYtDlpLine(job, line) {
   const text = line.trim();
   if (!text) return;
@@ -1850,10 +2496,26 @@ function handleYtDlpLine(job, line) {
   const progress = parseProgress(text);
   if (progress !== null) {
     const stats = parseDownloadStats(text);
+    const speedMBps = parseSpeedMBps(stats.speed);
+    if (speedMBps > 0) {
+      job.downloadSpeed = job.downloadSpeed || {
+        samples: 0,
+        sumMBps: 0,
+        maxMBps: 0,
+        minMBps: 0
+      };
+      job.downloadSpeed.samples += 1;
+      job.downloadSpeed.sumMBps += speedMBps;
+      job.downloadSpeed.maxMBps = Math.max(job.downloadSpeed.maxMBps || 0, speedMBps);
+      if (!job.downloadSpeed.minMBps || speedMBps < job.downloadSpeed.minMBps) {
+        job.downloadSpeed.minMBps = speedMBps;
+      }
+    }
+    const scaledProgress = Math.max(0, Math.min(95, progress * 0.95));
     setJobState(job, {
       status: "running",
       message: `Downloading... ${progress.toFixed(1)}%`,
-      progress,
+      progress: scaledProgress,
       speed: stats.speed,
       eta: stats.eta,
       totalSize: stats.totalSize
@@ -1862,11 +2524,14 @@ function handleYtDlpLine(job, line) {
   }
 
   if (text.includes("Destination:")) {
+    const destination = text.split("Destination:").slice(1).join("Destination:").trim();
+    const inferredTitle = destination ? displayTitleFromFilename(path.basename(destination)) : "";
     setJobState(job, {
       status: "running",
       message: "Preparing output file...",
       speed: null,
-      eta: null
+      eta: null,
+      title: inferredTitle || job.title
     });
     return;
   }
@@ -1887,6 +2552,7 @@ function handleYtDlpLine(job, line) {
     setJobState(job, {
       status: "processing",
       message,
+      progress: Math.max(95, Number(job.progress) || 0),
       speed: null,
       eta: null
     });
@@ -1897,6 +2563,7 @@ function handleYtDlpLine(job, line) {
     setJobState(job, {
       status: "processing",
       message: "Reusing previously downloaded media...",
+      progress: Math.max(95, Number(job.progress) || 0),
       speed: null,
       eta: null
     });
@@ -1914,24 +2581,28 @@ function handleYtDlpLine(job, line) {
   }
 }
 
-function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidia }) {
-  const format = formatSelector(type, quality, codec);
-  return [
+function buildYtDlpArgs({ url, type, quality, codec, jobDir, transcode, useNvidia, passThrough }) {
+  const direct = Boolean(passThrough);
+  const format = direct ? "best" : formatSelector(type, quality, codec);
+  const args = [
     "--no-playlist",
     "--no-overwrites",
     "--newline",
-    "--write-thumbnail",
-    "--convert-thumbnails",
-    "jpg",
     "-P",
     jobDir,
     "-o",
     "%(title).180B [%(id)s].%(ext)s",
     "-f",
-    format,
-    ...postProcessArgs(type, codec, { transcode, useNvidia }),
-    url
+    format
   ];
+
+  if (!direct) {
+    args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
+    args.push(...postProcessArgs(type, codec, { transcode, useNvidia }));
+  }
+
+  args.push(url);
+  return args;
 }
 
 function shouldRetryWithTranscode(type, lines) {
@@ -1949,13 +2620,14 @@ function shouldRetryWithTranscode(type, lines) {
 }
 
 function buildAttemptPlan(type) {
-  const plan = [{ transcode: false, useNvidia: false, label: "fast-remux" }];
+  const plan = [{ transcode: false, useNvidia: false, passThrough: false, label: "fast-remux" }];
   if (type === "a") return plan;
 
   if (NVIDIA_TRANSCODE_AVAILABLE) {
-    plan.push({ transcode: true, useNvidia: true, label: "gpu-transcode" });
+    plan.push({ transcode: true, useNvidia: true, passThrough: false, label: "gpu-transcode" });
   }
-  plan.push({ transcode: true, useNvidia: false, label: "cpu-transcode" });
+  plan.push({ transcode: true, useNvidia: false, passThrough: false, label: "cpu-transcode" });
+  plan.push({ transcode: false, useNvidia: false, passThrough: true, label: "pass-through" });
   return plan;
 }
 
@@ -1963,6 +2635,7 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
   const id = crypto.randomUUID();
   const userRoot = getUserRoot(ownerUsername);
   const jobDir = path.join(userRoot, id);
+  const createdAt = Date.now();
 
   fs.mkdirSync(jobDir, { recursive: true });
 
@@ -1970,6 +2643,11 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
     id,
     ownerUsername,
     ownerIp,
+    url,
+    type,
+    quality,
+    codec,
+    title: sourceLabelFromUrl(url),
     userRoot,
     status: "queued",
     message: "Queued...",
@@ -1978,10 +2656,16 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
     speed: null,
     eta: null,
     totalSize: null,
+    downloadSpeed: {
+      samples: 0,
+      sumMBps: 0,
+      maxMBps: 0,
+      minMBps: 0
+    },
     thumbnailUrl: null,
     downloadUrl: null,
     filePath: null,
-    createdAt: Date.now(),
+    createdAt,
     clients: new Set(),
     lastUpdate: {
       id,
@@ -1993,7 +2677,13 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
       speed: null,
       eta: null,
       totalSize: null,
-      thumbnailUrl: null
+      thumbnailUrl: null,
+      title: sourceLabelFromUrl(url),
+      url,
+      type,
+      quality,
+      codec,
+      createdAt
     }
   };
 
@@ -2011,13 +2701,16 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
       codec,
       jobDir,
       transcode: attempt.transcode,
-      useNvidia: attempt.useNvidia
+      useNvidia: attempt.useNvidia,
+      passThrough: attempt.passThrough
     });
     const attemptLines = [];
 
     const startMessage =
       attempt.label === "fast-remux"
         ? "Starting yt-dlp..."
+        : attempt.label === "pass-through"
+          ? "Retrying with direct download..."
         : attempt.useNvidia
           ? "Fast remux failed. Retrying with NVIDIA transcoding..."
           : "Fast remux failed. Retrying with CPU transcoding...";
@@ -2069,8 +2762,9 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
         const hasNextAttempt = attemptIndex + 1 < attempts.length;
         const canRetryFromRemux = !attempt.transcode && shouldRetryWithTranscode(type, attemptLines);
         const canRetryFromNvidia = attempt.transcode && attempt.useNvidia && hasNextAttempt;
+        const canRetryFromCpu = attempt.transcode && !attempt.useNvidia && hasNextAttempt;
 
-        if (hasNextAttempt && (canRetryFromRemux || canRetryFromNvidia)) {
+        if (hasNextAttempt && (canRetryFromRemux || canRetryFromNvidia || canRetryFromCpu)) {
           attemptIndex += 1;
           runAttempt();
           return;
@@ -2099,19 +2793,58 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
 
       job.filePath = filePath;
       const providerThumbPath = findProviderThumbnail(jobDir, filePath);
+      const fallbackThumbUrl = providerThumbPath ? "" : fallbackRemoteThumbnailUrl(url);
+      if (type === "a" && path.extname(filePath).toLowerCase() === ".mp3" && providerThumbPath) {
+        const iconCoverPath = createAudioCoverWithIcon(providerThumbPath);
+        if (iconCoverPath) {
+          embedMp3CoverArt(filePath, iconCoverPath);
+          try {
+            fs.rmSync(iconCoverPath, { force: true });
+          } catch {
+            // ignore temp cover cleanup failures
+          }
+        }
+      }
       let completedSize = job.totalSize;
+      let completedSizeBytes = 0;
       try {
         const stat = fs.statSync(filePath);
+        completedSizeBytes = Number(stat.size || 0);
         completedSize = formatBinaryBytes(stat.size) || completedSize;
       } catch {
         // ignore and keep prior size text
       }
+      const durationSec = probeMediaDurationSeconds(filePath);
+      const speedSamples = Number(job.downloadSpeed?.samples || 0);
+      const avgSpeedMBps = speedSamples > 0
+        ? Number(job.downloadSpeed.sumMBps || 0) / speedSamples
+        : 0;
+      const maxSpeedMBps = Number(job.downloadSpeed?.maxMBps || 0);
+      const minSpeedMBps = Number(job.downloadSpeed?.minMBps || 0);
 
       appendUserDownloadRecord(ownerUsername, {
         id,
         filePath,
         createdAt: job.createdAt,
-        thumbnailPath: providerThumbPath
+        thumbnailPath: providerThumbPath,
+        externalThumbnailUrl: fallbackThumbUrl,
+        sourceUrl: url,
+        mediaType: type,
+        quality,
+        title: displayTitleFromFilename(path.basename(filePath))
+      });
+      recordDownloadStat({
+        username: ownerUsername,
+        title: displayTitleFromFilename(path.basename(filePath)),
+        sourceUrl: url,
+        mediaType: type,
+        quality,
+        durationSec,
+        sizeBytes: completedSizeBytes,
+        avgSpeedMBps,
+        maxSpeedMBps,
+        minSpeedMBps,
+        createdAt: job.createdAt
       });
 
       setJobState(job, {
@@ -2121,7 +2854,10 @@ function startJob({ url, type, quality, codec, ownerUsername, ownerIp }) {
         speed: null,
         eta: null,
         totalSize: completedSize || "available",
-        thumbnailUrl: `/api/downloads/thumb/${encodeURIComponent(id)}`,
+        title: displayTitleFromFilename(path.basename(filePath)),
+        thumbnailUrl: providerThumbPath
+          ? `/api/downloads/thumb/${encodeURIComponent(id)}`
+          : (fallbackThumbUrl || `/api/downloads/thumb/${encodeURIComponent(id)}`),
         downloadUrl: `/api/jobs/${id}/file`
       });
 
@@ -2231,6 +2967,12 @@ async function start() {
   fs.mkdirSync(USERS_DOWNLOADS_DIR, { recursive: true });
   loadAccountsFromDisk();
   loadAccessRequestsFromDisk();
+  loadStatsFromDisk();
+  if (DATA_ENCRYPTION_KEY) {
+    // Normalize persisted state into encrypted-at-rest format on startup.
+    saveAccountsToDisk();
+    saveAccessRequestsToDisk();
+  }
   const dev = process.env.NODE_ENV !== "production";
   const nextApp = next({ dev, dir: ROOT, turbopack: false });
   const nextHandler = nextApp.getRequestHandler();
@@ -2570,6 +3312,17 @@ async function start() {
     nextApp.render(req, res, "/history");
   });
 
+  app.get("/stats", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const session = readValidSession(req);
+    if (!session) {
+      res.redirect("/login");
+      return;
+    }
+    setSessionCookie(req, res, session.id);
+    nextApp.render(req, res, "/stats");
+  });
+
   app.get("/login", (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     const session = readValidSession(req);
@@ -2600,14 +3353,25 @@ async function start() {
       entries: status.entries.map(entry => ({
         id: entry.id,
         fileName: entry.fileName,
+        title: entry.title || displayTitleFromFilename(entry.fileName),
+        sourceUrl: entry.sourceUrl || "",
+        mediaType: entry.mediaType || inferMediaTypeFromPath(entry.fileName),
+        quality: normalizeQualityValue(entry.quality) || "hq",
         sizeBytes: entry.sizeBytes,
         createdAt: entry.createdAt,
         downloadUrl: `/api/downloads/file/${encodeURIComponent(entry.id)}`,
-        thumbnailUrl: `/api/downloads/thumb/${encodeURIComponent(entry.id)}`
+        thumbnailUrl: entry.externalThumbnailUrl || `/api/downloads/thumb/${encodeURIComponent(entry.id)}`
       })),
       usageBytes: status.usageBytes,
       capBytes: status.capBytes,
       exceedsCap: status.exceedsCap
+    });
+  });
+
+  app.get("/api/stats", requireAuth, (_req, res) => {
+    res.json({
+      ok: true,
+      stats: buildStatsSnapshot()
     });
   });
 
@@ -2704,6 +3468,42 @@ async function start() {
     res.sendFile(thumbnailPath);
   });
 
+  app.post(["/report-bug", "/api/report-bug"], requireAuth, async (req, res) => {
+    const errorCodeRaw = String(req.body?.errorCode || "").trim();
+    if (!errorCodeRaw) {
+      res.status(400).json({ ok: false, error: "Missing error code." });
+      return;
+    }
+
+    const actionsRaw = Array.isArray(req.body?.actions) ? req.body.actions : [];
+    const actions = actionsRaw
+      .slice(-10)
+      .map(item => String(item || "").trim())
+      .filter(Boolean)
+      .map(item => item.slice(0, 240));
+
+    const report = {
+      username: req.auth.username,
+      ip: getClientIp(req),
+      userAgent: String(req.headers["user-agent"] || "").slice(0, 500),
+      errorCode: errorCodeRaw.slice(0, 120),
+      message: String(req.body?.message || "").slice(0, 500),
+      jobId: String(req.body?.jobId || "").slice(0, 120),
+      url: String(req.body?.url || "").slice(0, 500),
+      type: String(req.body?.type || "").slice(0, 40),
+      quality: String(req.body?.quality || "").slice(0, 40),
+      codec: String(req.body?.codec || "").slice(0, 80),
+      actions
+    };
+
+    try {
+      await sendBugReportEmail(report);
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ ok: false, error: error.message || "Unable to send bug report." });
+    }
+  });
+
   app.post(["/download", "/api/download"], requireAuth, (req, res) => {
     const validationError = validatePayload(req.body);
     if (validationError) {
@@ -2741,6 +3541,33 @@ async function start() {
       jobId,
       eventsUrl: `/api/jobs/${jobId}/events`
     });
+  });
+
+  app.get(["/jobs", "/api/jobs"], requireAuth, (req, res) => {
+    const list = Array.from(jobs.values())
+      .filter(job => job.ownerUsername === req.auth.username)
+      .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+      .map(job => ({
+        id: job.id,
+        status: job.status,
+        message: job.message,
+        progress: job.progress,
+        speed: job.speed,
+        eta: job.eta,
+        totalSize: job.totalSize,
+        error: job.error,
+        thumbnailUrl: job.thumbnailUrl || "",
+        downloadUrl: job.downloadUrl || "",
+        title: job.title || sourceLabelFromUrl(job.url || ""),
+        url: job.url || "",
+        type: job.type || "a+v",
+        quality: job.quality || "hq",
+        codec: job.codec || "h265",
+        createdAt: Number(job.createdAt || Date.now()),
+        eventsUrl: `/api/jobs/${job.id}/events`
+      }));
+
+    res.json({ ok: true, jobs: list });
   });
 
   app.get(["/jobs/:id/events", "/api/jobs/:id/events"], requireAuth, (req, res) => {
@@ -2821,6 +3648,9 @@ async function start() {
     }
     if (!GMAIL_APP_PASSWORD) {
       console.log("WARNING: Gmail access request email is not configured. Set GMAIL_APP_PASSWORD.");
+    }
+    if (!DATA_ENCRYPTION_KEY) {
+      console.log("WARNING: DATA_ENCRYPTION_KEY is not set. Username/email data at rest is not encrypted.");
     }
   });
 }

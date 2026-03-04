@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { backendFetch } from "./frontend-api";
 
 export default function Login() {
@@ -9,9 +9,31 @@ export default function Login() {
   const [pending, setPending] = useState(false);
   const [notice, setNotice] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [toast, setToast] = useState("");
+  const toastTimerRef = useRef(null);
 
   const isLogin = mode === "login";
   const REQUEST_TIMEOUT_MS = 15000;
+
+  const showToast = message => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    setToast(String(message || ""));
+    toastTimerRef.current = setTimeout(() => {
+      setToast("");
+      toastTimerRef.current = null;
+    }, 2800);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+      }
+    };
+  }, []);
 
   const postJson = async (url, body) => {
     const controller = new AbortController();
@@ -54,7 +76,13 @@ export default function Login() {
       });
 
       if (!resp.ok || !payload.ok) {
-        setNotice(payload.error || "Login failed.");
+        const errorText = String(payload.error || "Login failed.").trim();
+        if (errorText.toLowerCase() === "invalid username or password.") {
+          setNotice("");
+          showToast("Invalid username or password.");
+        } else {
+          setNotice(errorText);
+        }
         return;
       }
 
@@ -97,41 +125,11 @@ export default function Login() {
     }
   };
 
-  const handleForgotPassword = async () => {
-    const identifier = (isLogin ? username : email || username).trim();
-    if (!identifier) {
-      setNotice("Enter your username or email, then click Forgot password.");
-      return;
-    }
-
-    setPending(true);
-    setNotice("");
-
-    try {
-      const { resp, payload } = await postJson("auth/forgot-password", { identifier });
-      if (!resp.ok && payload?.error) {
-        setNotice(payload.error);
-        return;
-      }
-      setNotice(
-        payload?.message || "If an account matches that username/email, a reset link has been sent."
-      );
-    } catch (error) {
-      if (error.name === "AbortError") {
-        setNotice("Request timed out. Please try again.");
-      } else {
-        setNotice("Unable to reach server.");
-      }
-    } finally {
-      setPending(false);
-    }
-  };
-
   return (
     <div className="login-page">
       <div className="auth-shell">
         <div className="auth-core">
-          <div className="auth-title">dl.67mc.org</div>
+          <div className="auth-title">downloader</div>
 
           <div className="auth-card">
             <div className="field-group">
@@ -188,6 +186,16 @@ export default function Login() {
                   )}
                 </button>
               </div>
+              {isLogin && (
+                <button
+                  type="button"
+                  className="forgot-inline"
+                  disabled={pending}
+                  onClick={() => window.location.assign("/forgot-password")}
+                >
+                  Reset password
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -213,17 +221,6 @@ export default function Login() {
           >
             {isLogin ? "Request access" : "Back to login"}
           </button>
-
-          {isLogin && (
-            <button
-              type="button"
-              disabled={pending}
-              className="switch-btn"
-              onClick={handleForgotPassword}
-            >
-              Forgot password?
-            </button>
-          )}
 
           <div className={`notice ${notice ? "show" : ""}`}>{notice || "\u00A0"}</div>
         </div>
@@ -261,7 +258,7 @@ export default function Login() {
           font-size: 46px;
           line-height: 1;
           letter-spacing: 0.4px;
-          margin-bottom: 18px;
+          margin-bottom: 30px;
           color: #f4f0ff;
           font-family: var(--font-display);
           font-weight: 600;
@@ -277,6 +274,31 @@ export default function Login() {
           display: flex;
           flex-direction: column;
           gap: 0;
+        }
+
+        .forgot-inline {
+          margin-top: 6px;
+          margin-left: auto;
+          border: 0;
+          background: transparent;
+          color: rgba(202, 186, 229, 0.72);
+          font-size: 12px;
+          cursor: pointer;
+          padding: 0;
+          text-decoration: none;
+          transition: color 0.15s ease, text-decoration-color 0.15s ease;
+        }
+
+        .forgot-inline:hover:not(:disabled) {
+          color: rgba(221, 209, 243, 0.9);
+          text-decoration: underline;
+          text-underline-offset: 2px;
+          text-decoration-thickness: 1px;
+        }
+
+        .forgot-inline:disabled {
+          opacity: 0.6;
+          cursor: not-allowed;
         }
 
         .auth-actions {
@@ -404,6 +426,22 @@ export default function Login() {
           visibility: visible;
         }
 
+        .toast {
+          position: fixed;
+          top: 14px;
+          right: 14px;
+          max-width: min(92vw, 360px);
+          border-radius: 10px;
+          border: 1px solid rgba(255, 255, 255, 0.16);
+          background: rgba(26, 17, 43, 0.94);
+          color: #f2e9ff;
+          font-size: 12px;
+          line-height: 1.35;
+          padding: 9px 11px;
+          z-index: 50;
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+        }
+
         @media (max-width: 520px) {
           .auth-shell {
             transform: translateY(20px);
@@ -414,6 +452,8 @@ export default function Login() {
           }
         }
       `}</style>
+
+      {toast ? <div className="toast">{toast}</div> : null}
     </div>
   );
 }

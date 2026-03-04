@@ -25,6 +25,7 @@ cache/
 *.rdb
 access-requests.json
 user-accounts.json
+stats-store.json
 
 # Secrets / local config
 .env

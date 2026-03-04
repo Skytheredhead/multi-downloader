@@ -3,6 +3,7 @@ import { backendFetch, backendUrl } from "./frontend-api";
 
 const RETENTION_DAYS = 7;
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 12000;
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
@@ -16,10 +17,19 @@ function formatBytes(bytes) {
   return `${value.toFixed(index === 0 ? 0 : 2)} ${units[index]}`;
 }
 
-function formatDate(ts) {
+function formatDateCompact(ts) {
   const value = Number(ts || 0);
   if (!value) return "Unknown";
-  return new Date(value).toLocaleString();
+  const date = new Date(value);
+  const formatted = date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
+  });
+  return formatted.replace(/\s*([AP])M$/i, (_all, meridiem) => `${String(meridiem).toLowerCase()}`);
 }
 
 function daysRemaining(ts) {
@@ -30,6 +40,12 @@ function daysRemaining(ts) {
   return Math.ceil(remaining / (24 * 60 * 60 * 1000));
 }
 
+function cleanDisplayTitle(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return value.replace(/\s+\[[A-Za-z0-9_-]{6,}\]\s*$/u, "").trim() || value;
+}
+
 export default function HistoryPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -38,20 +54,64 @@ export default function HistoryPage() {
   const [capBytes, setCapBytes] = useState(10 * 1024 * 1024 * 1024);
 
   const storagePercent = capBytes > 0 ? Math.min(100, Math.round((usageBytes / capBytes) * 100)) : 0;
+  const hasEntries = entries.length > 0;
+
+  const fetchWithTimeout = async (path, init = {}) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      return await backendFetch(path, {
+        ...init,
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const parseApiPayload = async resp => {
+    const contentType = String(resp.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("application/json")) {
+      try {
+        const payload = await resp.json();
+        return { isJson: true, payload };
+      } catch {
+        // fall through to text handling
+      }
+    }
+
+    let text = "";
+    try {
+      text = await resp.text();
+    } catch {
+      text = "";
+    }
+    return { isJson: false, text };
+  };
 
   const loadHistory = async () => {
     setLoading(true);
     setError("");
 
     try {
-      const resp = await backendFetch("downloads/history");
+      const resp = await fetchWithTimeout("downloads/history", { cache: "no-store" });
 
       if (resp.status === 401) {
         window.location.assign("/login");
         return;
       }
 
-      const payload = await resp.json();
+      const parsed = await parseApiPayload(resp);
+      if (!parsed.isJson) {
+        if (resp.redirected || String(resp.url || "").includes("/login")) {
+          window.location.assign("/login");
+          return;
+        }
+        throw new Error("History API returned an invalid response.");
+      }
+
+      const payload = parsed.payload || {};
       if (String(payload?.error || "").toLowerCase().includes("authentication required")) {
         window.location.assign("/login");
         return;
@@ -64,8 +124,8 @@ export default function HistoryPage() {
         Array.isArray(payload.entries)
           ? payload.entries.map(entry => ({
             ...entry,
-            downloadUrl: backendUrl(entry.downloadUrl),
-            thumbnailUrl: backendUrl(entry.thumbnailUrl)
+            downloadUrl: entry.downloadUrl ? backendUrl(entry.downloadUrl) : "",
+            thumbnailUrl: entry.thumbnailUrl ? backendUrl(entry.thumbnailUrl) : ""
           }))
           : []
       );
@@ -81,7 +141,11 @@ export default function HistoryPage() {
         }
       }
     } catch (err) {
-      setError(err.message || "Failed to load history.");
+      if (err?.name === "AbortError") {
+        setError("History request timed out. Check backend connection.");
+      } else {
+        setError(err.message || "Failed to load history.");
+      }
     } finally {
       setLoading(false);
     }
@@ -98,14 +162,23 @@ export default function HistoryPage() {
     }
 
     try {
-      const resp = await backendFetch("downloads/clear", { method: "POST" });
+      const resp = await fetchWithTimeout("downloads/clear", { method: "POST" });
 
       if (resp.status === 401) {
         window.location.assign("/login");
         return;
       }
 
-      const payload = await resp.json();
+      const parsed = await parseApiPayload(resp);
+      if (!parsed.isJson) {
+        if (resp.redirected || String(resp.url || "").includes("/login")) {
+          window.location.assign("/login");
+          return;
+        }
+        throw new Error("Clear request returned an invalid response.");
+      }
+
+      const payload = parsed.payload || {};
       if (String(payload?.error || "").toLowerCase().includes("authentication required")) {
         window.location.assign("/login");
         return;
@@ -116,7 +189,11 @@ export default function HistoryPage() {
 
       await loadHistory();
     } catch (err) {
-      setError(err.message || "Failed to clear downloads.");
+      if (err?.name === "AbortError") {
+        setError("Clear request timed out. Check backend connection.");
+      } else {
+        setError(err.message || "Failed to clear downloads.");
+      }
     }
   };
 
@@ -143,7 +220,20 @@ export default function HistoryPage() {
       <div className="history-main">
         <div className="history-shell">
           <div className="history-head">
-            <button className="back-btn" type="button" onClick={() => window.location.assign("/")} aria-label="Back" title="Back">
+            <button
+              className="back-btn"
+              type="button"
+              onClick={() => {
+                try {
+                  window.sessionStorage.setItem("md_from_history", "1");
+                } catch {
+                  // ignore storage errors
+                }
+                window.location.assign("/");
+              }}
+              aria-label="Back"
+              title="Back"
+            >
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M15 18l-6-6 6-6" />
               </svg>
@@ -155,32 +245,65 @@ export default function HistoryPage() {
 
           {loading ? (
             <div className="empty-state">Loading...</div>
-          ) : entries.length === 0 ? (
+          ) : !hasEntries && !error ? (
             <div className="empty-state">No downloads in the past 7 days.</div>
-          ) : (
+          ) : hasEntries ? (
             <div className="history-list">
               {entries.map(entry => (
                 <div key={entry.id} className="history-item">
                   <div className="thumb-wrap">
-                    <img
-                      src={entry.thumbnailUrl}
-                      alt="thumbnail"
-                      className="thumb"
-                      loading="lazy"
-                      onError={event => {
-                        event.currentTarget.style.display = "none";
-                        const fallback = event.currentTarget.parentElement?.querySelector(".thumb-fallback");
-                        if (fallback) fallback.style.display = "grid";
-                      }}
-                    />
-                    <div className="thumb-fallback">No Thumbnail</div>
+                    {entry.thumbnailUrl ? (
+                      <img
+                        src={entry.thumbnailUrl}
+                        alt="thumbnail"
+                        className={`thumb ${entry.mediaType === "a" || entry.mediaType === "v" ? "thumb-dimmed" : ""}`}
+                        loading="lazy"
+                        onError={event => {
+                          event.currentTarget.style.display = "none";
+                          const fallback = event.currentTarget.parentElement?.querySelector(".thumb-fallback");
+                          if (fallback) fallback.style.display = "grid";
+                        }}
+                      />
+                    ) : null}
+                    {entry.mediaType === "a" && entry.thumbnailUrl ? (
+                      <div className="audio-note-badge" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M9 17a2 2 0 1 1-2-2 2 2 0 0 1 2 2z" />
+                          <path d="M17 15a2 2 0 1 1-2-2 2 2 0 0 1 2 2z" />
+                          <path d="M9 17V7l8-2v10" />
+                        </svg>
+                      </div>
+                    ) : entry.mediaType === "v" && entry.thumbnailUrl ? (
+                      <div className="audio-note-badge" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="3" y="5" width="18" height="14" rx="2.4" />
+                          <path d="M8 3v4" />
+                          <path d="M16 3v4" />
+                          <path d="M3 10h18" />
+                        </svg>
+                      </div>
+                    ) : null}
+                    <div className="thumb-fallback" style={{ display: entry.thumbnailUrl ? "none" : "grid" }}>No Thumbnail</div>
                   </div>
 
                   <div className="meta-col">
-                    <div className="file-title">{entry.fileName || "Untitled"}</div>
-                    <div className="meta-row">Size: {formatBytes(entry.sizeBytes)}</div>
-                    <div className="meta-row">Downloaded: {formatDate(entry.createdAt)}</div>
-                    <div className="meta-row">Days Remaining: {daysRemaining(entry.createdAt)}</div>
+                    <div className="file-title">{cleanDisplayTitle(entry.title || entry.fileName || "Untitled")}</div>
+                    <div className="meta-row source-row" title={entry.sourceUrl || "Source unavailable"}>
+                      {entry.sourceUrl ? (
+                        <a
+                          href={entry.sourceUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="source-link"
+                        >
+                          {entry.sourceUrl}
+                        </a>
+                      ) : (
+                        "unavailable"
+                      )}
+                    </div>
+                    <div className="meta-row">Size: {formatBytes(entry.sizeBytes)} | {String(entry.quality || "hq")}</div>
+                    <div className="meta-row">{formatDateCompact(entry.createdAt)} | {daysRemaining(entry.createdAt)}d remaining</div>
                   </div>
 
                   <div className="item-actions">
@@ -195,10 +318,12 @@ export default function HistoryPage() {
                 </div>
               ))}
             </div>
-          )}
+          ) : null}
 
-          <div className="bottom-controls">
-            <button className="clear-btn" onClick={() => clearAll()}>Clear All</button>
+          <div className={`bottom-controls ${hasEntries ? "" : "empty"}`}>
+            {hasEntries ? (
+              <button className="clear-btn" onClick={() => clearAll()}>clear all</button>
+            ) : null}
             <div className="storage-chip">
               <div className="storage-text">Storage: {storagePercent}%</div>
               <div className="storage-bar">
@@ -331,7 +456,26 @@ export default function HistoryPage() {
           height: 100%;
           object-fit: cover;
           display: block;
-          filter: grayscale(1) sepia(0.32) hue-rotate(232deg) saturate(1.6) contrast(1.06) brightness(0.9);
+          filter: none;
+        }
+
+        .thumb-dimmed {
+          filter: brightness(0.56);
+        }
+
+        .audio-note-badge {
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          transform: translate(-50%, -50%);
+          width: 40px;
+          height: 40px;
+          color: rgba(242, 242, 247, 0.95);
+          display: grid;
+          place-items: center;
+          filter: drop-shadow(0 2px 1px rgba(0, 0, 0, 0.78))
+            drop-shadow(0 0 8px rgba(0, 0, 0, 0.48));
+          pointer-events: none;
         }
 
         .thumb-fallback {
@@ -347,6 +491,23 @@ export default function HistoryPage() {
           font-size: 13px;
           color: #e9e0f6;
           line-height: 1.4;
+        }
+
+        .source-row {
+          color: #d8cdec;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .source-link {
+          color: inherit;
+          text-decoration: none;
+        }
+
+        .source-link:hover {
+          text-decoration: underline;
+          text-underline-offset: 2px;
         }
 
         .file-title {
@@ -395,27 +556,35 @@ export default function HistoryPage() {
 
         .bottom-controls {
           margin-top: 18px;
+          width: 100%;
           display: flex;
+          flex-direction: column;
           align-items: center;
-          justify-content: space-between;
+          justify-content: center;
           gap: 10px;
           flex-wrap: wrap;
         }
 
+        .bottom-controls.empty {
+          width: 100%;
+          align-items: flex-end;
+          justify-content: flex-start;
+        }
+
         .clear-btn {
-          height: 36px;
-          min-width: 120px;
-          border-radius: 8px;
-          border: 1px solid rgba(255, 255, 255, 0.16);
-          background: rgba(255, 255, 255, 0.12);
+          background: transparent;
+          border: 0;
           color: #fff;
           cursor: pointer;
           font-size: 13px;
-          transition: transform 0.16s ease, background 0.16s ease;
+          text-decoration: underline;
+          text-underline-offset: 2px;
+          text-decoration-thickness: 1px;
+          transition: opacity 0.16s ease;
         }
 
         .clear-btn:hover {
-          background: rgba(255, 255, 255, 0.2);
+          opacity: 0.8;
         }
 
         .storage-chip {
@@ -427,6 +596,7 @@ export default function HistoryPage() {
           display: flex;
           flex-direction: column;
           gap: 5px;
+          align-self: flex-end;
         }
 
         .storage-text {
