@@ -77,7 +77,8 @@ Backend minimum for split mode in `local-secrets.txt`:
 
 ```txt
 CORS_ALLOWED_ORIGINS=https://dl.67mc.org
-DOWNLOAD_PROXY=socks5://127.0.0.1:40000
+# proxy is off by default; set only if you want one
+# DOWNLOAD_PROXY=socks5://127.0.0.1:40000
 ```
 
 Full deployment guide:
@@ -87,24 +88,16 @@ Full deployment guide:
 - `deploy/systemd/multi-downloader.service.example`
 - `.env.vercel.example`
 
-## Default Proxy
+## Proxy (Optional)
 
-Downloads are routed through this proxy by default:
-
-`socks5://127.0.0.1:40000`
-
-This is applied to yt-dlp via `--proxy` on every download.
-
-## Proxy Override
-
-You can override or disable it in `local-secrets.txt`:
+Proxying is disabled by default. To enable it in `local-secrets.txt`:
 
 ```txt
-# override
+# enable
 DOWNLOAD_PROXY=socks5://127.0.0.1:40000
 
 # disable proxy explicitly
-# DOWNLOAD_PROXY=off
+DOWNLOAD_PROXY=off
 ```
 
 `YTDLP_PROXY` is also accepted as a fallback env var.

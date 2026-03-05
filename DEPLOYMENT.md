@@ -34,8 +34,8 @@ CORS_ALLOWED_ORIGINS=https://dl.67mc.org
 # Optional explicit API review links
 ACCESS_REVIEW_BASE_URL=https://dlapi.67mc.org
 
-# Default proxy (already defaulted in code, but explicit is clearer)
-DOWNLOAD_PROXY=socks5://127.0.0.1:40000
+# Proxy is optional; default is off
+# DOWNLOAD_PROXY=socks5://127.0.0.1:40000
 
 # Optional: reconnect proxy/VPN on YouTube bot-check failures
 # PROXY_RESTART_CMD=sudo systemctl restart warp-svc

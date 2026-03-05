@@ -98,7 +98,7 @@ const STATS_STORE_FILE = path.join(ROOT, "stats-store.json");
 const STATS_MAX_RECORDS = 10000;
 const VIDEO_ACCEL_MODE = String(process.env.VIDEO_ACCEL_MODE || "auto").toLowerCase();
 const DOWNLOAD_PROXY = String(
-  process.env.DOWNLOAD_PROXY || process.env.YTDLP_PROXY || "socks5://127.0.0.1:40000"
+  process.env.DOWNLOAD_PROXY || process.env.YTDLP_PROXY || "off"
 ).trim();
 const PROXY_DISABLED_PATTERN = /^(none|off|disabled)$/i;
 const DOWNLOAD_PROXY_ENABLED = Boolean(DOWNLOAD_PROXY && !PROXY_DISABLED_PATTERN.test(DOWNLOAD_PROXY));
